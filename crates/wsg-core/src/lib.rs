@@ -1,5 +1,6 @@
 //! Core types for WindowsSystemGuard: records and the crash-consistent ring file.
 
+pub mod archive;
 pub mod clock;
 pub mod record;
 pub mod ring;
