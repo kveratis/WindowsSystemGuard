@@ -1,0 +1,1 @@
+//! wsg-analysis stub.

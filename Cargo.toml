@@ -1,0 +1,3 @@
+[workspace]
+resolver = "2"
+members = ["crates/wsg-core", "crates/wsg-recorder", "crates/wsg-events", "crates/wsg-analysis", "crates/wsg-cli"]
