@@ -68,6 +68,15 @@ fn five_rapid_restarts_create_one_incident() {
         archive_if_unclean(&ring, &arc, NEW, i).unwrap().unwrap();
     }
     assert_eq!(list_incidents(&arc).len(), 1);
+    let dirs: Vec<_> = std::fs::read_dir(&arc).unwrap().flatten().collect();
+    assert_eq!(dirs.len(), 1);
+    let mut names: Vec<String> = std::fs::read_dir(dirs[0].path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["incident.json", "ring.bin"]);
 }
 
 #[test]
@@ -95,4 +104,55 @@ fn archived_copy_matches_original_records() {
     let b = RingReader::open(&arc.join(&id.0).join("ring.bin")).unwrap().records();
     assert_eq!(a, b);
     assert_eq!(a.len(), 5);
+}
+
+#[test]
+fn retry_succeeds_with_stale_partial_and_ring_bin_without_meta() {
+    let d = tempfile::tempdir().unwrap();
+    let ring = d.path().join("ring.bin");
+    let arc = d.path().join("arc");
+    make_ring(&ring, false);
+    let id = format!("inc-{}", "07".repeat(16));
+    let dir = arc.join(&id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("ring.bin.partial"), b"junk").unwrap();
+    std::fs::write(dir.join("ring.bin"), b"stale").unwrap();
+    let got = archive_if_unclean(&ring, &arc, NEW, 5).unwrap().unwrap();
+    assert_eq!(got.0, id);
+    assert!(!dir.join("ring.bin.partial").exists());
+    assert_eq!(RingReader::open(&dir.join("ring.bin")).unwrap().records().len(), 5);
+    assert_eq!(list_incidents(&arc).len(), 1);
+}
+
+#[test]
+fn corrupt_incident_json_is_rearchived() {
+    let d = tempfile::tempdir().unwrap();
+    let ring = d.path().join("ring.bin");
+    let arc = d.path().join("arc");
+    make_ring(&ring, false);
+    let id = archive_if_unclean(&ring, &arc, NEW, 1).unwrap().unwrap();
+    std::fs::write(arc.join(&id.0).join("incident.json"), b"{\"id\":").unwrap();
+    assert!(list_incidents(&arc).is_empty());
+    archive_if_unclean(&ring, &arc, NEW, 2).unwrap().unwrap();
+    let l = list_incidents(&arc);
+    assert_eq!(l.len(), 1);
+    assert_eq!(l[0].detected_utc_ns, 2);
+}
+
+#[test]
+fn second_incident_from_different_boot_preserves_first() {
+    let d = tempfile::tempdir().unwrap();
+    let arc = d.path().join("arc");
+    let r1 = d.path().join("r1.bin");
+    make_ring(&r1, false);
+    let a = archive_if_unclean(&r1, &arc, NEW, 1).unwrap().unwrap();
+    let a_bytes = std::fs::read(arc.join(&a.0).join("ring.bin")).unwrap();
+    let r2 = d.path().join("r2.bin");
+    let mut ring = Ring::create(&r2, 64 * 1024).unwrap();
+    ring.append(RecordKind::Sample, BootId([8u8; 16]), 1, 1, b"x").unwrap();
+    ring.flush().unwrap();
+    let b = archive_if_unclean(&r2, &arc, NEW, 2).unwrap().unwrap();
+    assert_ne!(a, b);
+    assert_eq!(list_incidents(&arc).len(), 2);
+    assert_eq!(std::fs::read(arc.join(&a.0).join("ring.bin")).unwrap(), a_bytes);
 }
