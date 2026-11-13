@@ -18,6 +18,9 @@ pub enum SampleFragment {
     Mem(Reading<MemStats>),
     Disks(Vec<DiskStats>),
     Net(Vec<NetStats>),
+    /// The collector tried and failed; `assemble` records its reason.
+    DisksUnavailable(String),
+    NetUnavailable(String),
     Procs(Vec<ProcStat>),
     Wsl(Reading<bool>),
     /// Liveness proof; ignored by `assemble` (written as its own heartbeat record).
@@ -62,8 +65,8 @@ pub fn assemble(frags: Vec<SampleFragment>, cycle_ms: u32) -> Sample {
     let mut s = Sample {
         cpu: missing(),
         mem: missing(),
-        disks: vec![],
-        net: vec![],
+        disks: missing(),
+        net: missing(),
         procs: vec![],
         gpu: missing(),
         sensors: missing(),
@@ -74,8 +77,10 @@ pub fn assemble(frags: Vec<SampleFragment>, cycle_ms: u32) -> Sample {
         match f {
             SampleFragment::Cpu(r) => s.cpu = r,
             SampleFragment::Mem(r) => s.mem = r,
-            SampleFragment::Disks(v) => s.disks = v,
-            SampleFragment::Net(v) => s.net = v,
+            SampleFragment::Disks(v) => s.disks = value(v),
+            SampleFragment::DisksUnavailable(reason) => s.disks = Reading::Unavailable { reason },
+            SampleFragment::Net(v) => s.net = value(v),
+            SampleFragment::NetUnavailable(reason) => s.net = Reading::Unavailable { reason },
             SampleFragment::Procs(v) => s.procs = v,
             SampleFragment::Wsl(r) => s.wsl_vm_running = r,
             SampleFragment::Heartbeat { .. } => {}

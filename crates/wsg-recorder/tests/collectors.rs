@@ -33,7 +33,8 @@ fn assemble_marks_missing_fragments_unavailable_not_zero() {
     assert!(matches!(s.gpu, Reading::Unavailable { .. }));
     assert!(matches!(s.sensors, Reading::Unavailable { .. }));
     assert!(matches!(s.wsl_vm_running, Reading::Unavailable { .. }));
-    assert!(s.disks.is_empty() && s.net.is_empty() && s.procs.is_empty());
+    assert!(matches!(s.disks, Reading::Unavailable { .. }) && matches!(s.net, Reading::Unavailable { .. }));
+    assert!(s.procs.is_empty());
 }
 
 #[test]
@@ -110,7 +111,7 @@ mod assemble_populated {
         );
         assert!(matches!(s.cpu, Reading::Value { ref v, .. } if v.total_pct == 5.0));
         assert!(matches!(s.mem, Reading::Value { ref v, .. } if v.available_bytes == 2));
-        assert_eq!(s.disks.len(), 1);
+        assert!(matches!(s.disks, Reading::Value { ref v, .. } if v.len() == 1));
         assert!(matches!(s.wsl_vm_running, Reading::Value { v: true, .. }));
     }
 
@@ -127,4 +128,30 @@ mod assemble_populated {
         assert!(matches!(s.cpu, Reading::Value { ref v, .. } if v.total_pct == 7.0));
         assert!(matches!(s.mem, Reading::Unavailable { .. }));
     }
+}
+
+#[test]
+fn omitted_disks_fragment_becomes_unavailable_with_reason() {
+    let s = assemble(vec![], 10);
+    assert!(matches!(s.disks, Reading::Unavailable { ref reason } if reason == "no collector result"));
+    assert!(matches!(s.net, Reading::Unavailable { ref reason } if reason == "no collector result"));
+}
+
+#[test]
+fn disks_unavailable_fragment_carries_collector_reason() {
+    let s = assemble(
+        vec![SampleFragment::Multi(vec![
+            SampleFragment::DisksUnavailable("disk queue: counter not available".into()),
+            SampleFragment::NetUnavailable("net down".into()),
+        ])],
+        10,
+    );
+    assert!(matches!(s.disks, Reading::Unavailable { ref reason } if reason == "disk queue: counter not available"));
+    assert!(matches!(s.net, Reading::Unavailable { ref reason } if reason == "net down"));
+}
+
+#[test]
+fn empty_net_result_is_value_not_error() {
+    let s = assemble(vec![SampleFragment::Net(vec![])], 10);
+    assert!(matches!(s.net, Reading::Value { ref v, .. } if v.is_empty()));
 }

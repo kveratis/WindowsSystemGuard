@@ -11,8 +11,8 @@ fn sample() -> Sample {
             v: MemStats { commit_bytes: 1, available_bytes: 2, nonpaged_pool_bytes: 3, paged_pool_bytes: 4 },
             age_ms: 0,
         },
-        disks: vec![DiskStats { disk_id: "0 C:".into(), queue_len: 1.5, read_latency_ms: 2.0, write_latency_ms: 3.0, bytes_per_sec: 4 }],
-        net: vec![NetStats { adapter: "eth0".into(), bytes_per_sec: 99 }],
+        disks: Reading::Value { age_ms: 0, v: vec![DiskStats { disk_id: "0 C:".into(), queue_len: 1.5, read_latency_ms: 2.0, write_latency_ms: 3.0, bytes_per_sec: 4 }] },
+        net: Reading::Value { age_ms: 0, v: vec![NetStats { adapter: "eth0".into(), bytes_per_sec: 99 }] },
         procs: vec![ProcStat { pid: 4, name: "System".into(), cpu_pct: 0.1, working_set_bytes: 5, io_bytes_per_sec: 6, handles: 7 }],
         gpu: unavailable(),
         sensors: Reading::Value {
@@ -33,9 +33,13 @@ fn sample() -> Sample {
 fn unavailable_roundtrips_and_is_not_zero() {
     let mut s = sample();
     s.cpu = unavailable();
+    s.disks = Reading::Unavailable { reason: "pdh down".into() };
+    s.net = unavailable();
     let d = Sample::decode(&s.encode()).unwrap();
     assert!(matches!(d.cpu, Reading::Unavailable { ref reason } if reason == "no counter"));
     assert!(!matches!(d.cpu, Reading::Value { .. }));
+    assert!(matches!(d.disks, Reading::Unavailable { ref reason } if reason == "pdh down"));
+    assert!(matches!(d.net, Reading::Unavailable { ref reason } if reason == "no counter"));
 }
 
 #[test]

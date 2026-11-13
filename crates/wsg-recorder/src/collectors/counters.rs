@@ -42,9 +42,19 @@ fn array(h: Option<PDH_HCOUNTER>, what: &str, errors: &mut Vec<String>) -> Optio
     };
     let (mut size, mut n) = (0u32, 0u32);
     // SAFETY: size query with a null buffer, per PDH contract (returns PDH_MORE_DATA).
-    unsafe { PdhGetFormattedCounterArrayW(h, PDH_FMT_DOUBLE, &mut size, &mut n, std::ptr::null_mut()) };
+    let rc = unsafe { PdhGetFormattedCounterArrayW(h, PDH_FMT_DOUBLE, &mut size, &mut n, std::ptr::null_mut()) };
+    const PDH_MORE_DATA: u32 = 0x800007D2;
+    const PDH_NO_DATA: u32 = 0x800007D5;
     if size == 0 {
-        errors.push(format!("{what}: size query failed"));
+        // A successful query with no instances (e.g. no adapters) is an empty value, not an error.
+        if rc == 0 || rc == PDH_NO_DATA {
+            return Some(vec![]);
+        }
+        errors.push(format!("{what}: size query failed 0x{rc:08x}"));
+        return None;
+    }
+    if rc != PDH_MORE_DATA && rc != 0 {
+        errors.push(format!("{what}: size query failed 0x{rc:08x}"));
         return None;
     }
     // u64 backing keeps the buffer 8-byte aligned for PDH_FMT_COUNTERVALUE_ITEM_W.
@@ -80,6 +90,12 @@ fn array(h: Option<PDH_HCOUNTER>, what: &str, errors: &mut Vec<String>) -> Optio
 }
 
 type Pairs = Vec<(String, f64)>;
+
+pub(crate) fn net_stats(v: Pairs) -> Vec<NetStats> {
+    v.into_iter()
+        .map(|(adapter, v)| NetStats { adapter, bytes_per_sec: v as u64 })
+        .collect()
+}
 
 /// A disk is emitted only when all four values exist for its instance; otherwise it is skipped
 /// and noted. Never zero-fills.
@@ -199,6 +215,7 @@ impl Collector for CounterCollector {
     // shortcut: PdhCollectQueryData blocks and cannot be cancelled; budget is checked only after
     // it returns. Upgrade to a worker thread if PDH is seen to stall.
     fn collect(&mut self, budget: Duration) -> CollectOutcome {
+        self.errors.clear();
         let t = Instant::now();
         // SAFETY: q is live for the lifetime of self.
         let rc = unsafe { PdhCollectQueryData(self.q) };
@@ -228,6 +245,7 @@ impl Collector for CounterCollector {
             return CollectOutcome::TimedOut;
         }
         let mut errors = vec![];
+        let d0 = errors.len();
         let disks = disk_part(
             array(self.disk.queue, "disk queue", &mut errors),
             array(self.disk.rd, "disk read latency", &mut errors),
@@ -235,11 +253,15 @@ impl Collector for CounterCollector {
             array(self.disk.bps, "disk bytes/sec", &mut errors),
             &mut errors,
         );
-        let net = array(self.net, "net bytes/sec", &mut errors).map(|v| {
-            v.into_iter()
-                .map(|(adapter, v)| NetStats { adapter, bytes_per_sec: v as u64 })
-                .collect()
-        });
+        let disks_frag = match disks {
+            Some(d) => SampleFragment::Disks(d),
+            None => SampleFragment::DisksUnavailable(errors[d0..].join("; ")),
+        };
+        let n0 = errors.len();
+        let net_frag = match array(self.net, "net bytes/sec", &mut errors) {
+            Some(v) => SampleFragment::Net(net_stats(v)),
+            None => SampleFragment::NetUnavailable(errors[n0..].join("; ")),
+        };
         if matches!(cpu, Reading::Unavailable { .. }) {
             errors.push("cpu counters not ready".into());
         }
@@ -247,11 +269,12 @@ impl Collector for CounterCollector {
             errors.push("memory counters unavailable".into());
         }
         self.errors = errors;
-        // Parts that failed are omitted so `assemble` marks them missing.
-        let mut parts = vec![SampleFragment::Cpu(cpu), SampleFragment::Mem(mem)];
-        parts.extend(disks.map(SampleFragment::Disks));
-        parts.extend(net.map(SampleFragment::Net));
-        CollectOutcome::Ok(SampleFragment::Multi(parts))
+        CollectOutcome::Ok(SampleFragment::Multi(vec![
+            SampleFragment::Cpu(cpu),
+            SampleFragment::Mem(mem),
+            disks_frag,
+            net_frag,
+        ]))
     }
 }
 

@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+// Stays 1: disks/net became `Reading<Vec<_>>` before any data had been written.
 pub const SAMPLE_SCHEMA_VERSION: u8 = 1;
 
 /// A reading that is either a value (with its age) or explicitly unavailable, never a silent zero.
@@ -72,8 +73,8 @@ pub struct SensorSet {
 pub struct Sample {
     pub cpu: Reading<CpuStats>,
     pub mem: Reading<MemStats>,
-    pub disks: Vec<DiskStats>,
-    pub net: Vec<NetStats>,
+    pub disks: Reading<Vec<DiskStats>>,
+    pub net: Reading<Vec<NetStats>>,
     pub procs: Vec<ProcStat>,
     pub gpu: Reading<GpuStats>,
     pub sensors: Reading<SensorSet>,
