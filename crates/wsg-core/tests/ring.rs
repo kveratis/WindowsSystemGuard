@@ -1,5 +1,7 @@
 use std::fs::OpenOptions;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier};
 use wsg_core::{BootId, RecordKind, Ring, RingError, RingReader};
 
 const BOOT: BootId = BootId([7u8; 16]);
@@ -154,7 +156,7 @@ fn ended_cleanly_only_after_marker() {
     let path = dir.path().join("ring.bin");
     let mut ring = Ring::create(&path, 64 * 1024).unwrap();
     assert!(!RingReader::open(&path).unwrap().ended_cleanly());
-    ring.append(RecordKind::Sample, BOOT, 0, 1, b"s").unwrap();
+    ring.append(RecordKind::Sample, BOOT, 0, 42, b"s").unwrap();
     assert!(!RingReader::open(&path).unwrap().ended_cleanly());
 
     ring.mark_clean_shutdown(BOOT).unwrap();
@@ -163,6 +165,7 @@ fn ended_cleanly_only_after_marker() {
     let last = reader.records().pop().unwrap();
     assert_eq!(last.kind, RecordKind::Marker);
     assert_eq!(last.payload, b"clean");
+    assert_eq!(last.mono_ns, 42, "marker carries the last appended mono_ns");
 
     ring.append(RecordKind::Sample, BOOT, 0, 2, b"s").unwrap();
     assert!(!RingReader::open(&path).unwrap().ended_cleanly());
@@ -186,31 +189,48 @@ fn orders_by_seq_when_wall_clock_goes_backwards() {
 fn reader_can_read_while_writer_appends() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ring.bin");
-    let mut ring = Ring::create(&path, 1024 * 1024).unwrap();
-    const N: u64 = 300;
+    // Small capacity: about 60 frames per lap, so the writer wraps many times during the reads.
+    let mut ring = Ring::create(&path, 8192).unwrap();
+    const N: u64 = 1000;
+    let start = Arc::new(Barrier::new(2));
+    let done = Arc::new(AtomicBool::new(false));
 
+    let (wstart, wdone) = (start.clone(), done.clone());
     let writer = std::thread::spawn(move || {
+        wstart.wait();
         for i in 1..=N {
             ring.append(RecordKind::Sample, BOOT, 0, i, &payload_for(i, 80)).unwrap();
         }
         ring.flush().unwrap();
+        wdone.store(true, Ordering::SeqCst);
     });
     let rpath = path.clone();
     let reader = std::thread::spawn(move || {
-        let mut reads = 0;
-        loop {
+        start.wait();
+        let mut mid_write_snapshots = 0;
+        while !done.load(Ordering::SeqCst) {
             let recs = RingReader::open(&rpath).unwrap().records();
-            for (i, r) in recs.iter().enumerate() {
-                assert_eq!(r.seq, i as u64 + 1);
+            // A snapshot racing a wrap may mix two laps: require order and intact payloads only.
+            assert!(recs.windows(2).all(|w| w[1].seq > w[0].seq));
+            for r in &recs {
                 assert_eq!(r.payload, payload_for(r.seq, 80));
             }
-            reads += 1;
-            if recs.len() as u64 == N {
-                return reads;
+            if !recs.is_empty() && recs.last().unwrap().seq < N {
+                mid_write_snapshots += 1;
             }
         }
+        mid_write_snapshots
     });
     writer.join().unwrap();
-    assert!(reader.join().unwrap() >= 1);
-    assert_eq!(seqs(&path).len() as u64, N);
+    assert!(reader.join().unwrap() >= 1, "reader never overlapped the writer");
+
+    let recs = RingReader::open(&path).unwrap().records();
+    assert!(!recs.is_empty() && (recs.len() as u64) < N);
+    assert_eq!(recs.last().unwrap().seq, N);
+    for w in recs.windows(2) {
+        assert_eq!(w[1].seq, w[0].seq + 1);
+    }
+    for r in &recs {
+        assert_eq!(r.payload, payload_for(r.seq, 80));
+    }
 }

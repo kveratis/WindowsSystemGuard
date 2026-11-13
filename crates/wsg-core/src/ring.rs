@@ -40,6 +40,7 @@ pub struct Ring {
     head: u64,
     next_seq: u64,
     durable_seq: u64,
+    last_mono: u64,
 }
 
 impl Ring {
@@ -54,19 +55,21 @@ impl Ring {
         header.extend_from_slice(&capacity_bytes.to_le_bytes());
         file.write_all(&header)?;
         file.sync_all()?;
-        Ok(Ring { file, capacity: capacity_bytes, head: 0, next_seq: 1, durable_seq: 0 })
+        Ok(Ring { file, capacity: capacity_bytes, head: 0, next_seq: 1, durable_seq: 0, last_mono: 0 })
     }
 
     pub fn open(path: &Path) -> Result<Ring, RingError> {
         let mut file = open_rw(path, false)?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        let (capacity, frames, _) = parse(&bytes)?;
-        let (head, last) = frames
-            .iter()
-            .max_by_key(|(_, _, r)| r.seq)
-            .map_or((0, 0), |(off, len, r)| ((off + len) as u64, r.seq));
-        Ok(Ring { file, capacity, head, next_seq: last + 1, durable_seq: last })
+        // Keep only the highest-seq frame: (end offset, seq, mono_ns).
+        let mut newest = (0u64, 0u64, 0u64);
+        let capacity = scan(&mut file, SCAN_CHUNK, |off, len, r| {
+            if r.seq > newest.1 {
+                newest = (off + len, r.seq, r.mono_ns);
+            }
+        })?
+        .capacity;
+        let (head, last, last_mono) = newest;
+        Ok(Ring { file, capacity, head, next_seq: last + 1, durable_seq: last, last_mono })
     }
 
     pub fn append(
@@ -102,6 +105,7 @@ impl Ring {
         self.write_at(self.head, &frame)?;
         self.head += frame_len;
         self.next_seq += 1;
+        self.last_mono = mono_ns;
         Ok(seq)
     }
 
@@ -117,12 +121,13 @@ impl Ring {
     }
 
     /// Appends a `Marker` record with payload `b"clean"` and flushes it. The marker carries the
-    /// current wall-clock time and `mono_ns` 0, since the ring has no monotonic clock of its own.
+    /// current wall-clock time and the `mono_ns` of the last appended record, since the ring has
+    /// no monotonic clock of its own.
     pub fn mark_clean_shutdown(&mut self, boot: BootId) -> Result<(), RingError> {
         let utc_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as i64);
-        self.append(RecordKind::Marker, boot, utc_ns, 0, MARKER_CLEAN)?;
+        self.append(RecordKind::Marker, boot, utc_ns, self.last_mono, MARKER_CLEAN)?;
         self.flush()
     }
 
@@ -153,13 +158,18 @@ pub struct RingReader {
 impl RingReader {
     /// Reads a snapshot of the ring. Safe while a writer appends: a frame in flight fails its
     /// CRC and is counted as corrupt.
+    /// Memory is bounded by the scan buffer plus the decoded valid records, not the file size.
+    /// A snapshot taken while the writer wraps can mix two laps, so only the order by `seq` is
+    /// guaranteed, not contiguity.
     pub fn open(path: &Path) -> Result<RingReader, RingError> {
-        // shortcut: reads the whole file into memory; stream it if rings grow past a few hundred MB.
-        let bytes = std::fs::read(path)?;
-        let (_, frames, skipped) = parse(&bytes)?;
-        let mut records: Vec<Record> = frames.into_iter().map(|(_, _, r)| r).collect();
+        Self::open_chunked(path, SCAN_CHUNK)
+    }
+
+    fn open_chunked(path: &Path, chunk: usize) -> Result<RingReader, RingError> {
+        let mut records = Vec::new();
+        let scan = scan(File::open(path)?, chunk, |_, _, r| records.push(r))?;
         records.sort_by_key(|r| r.seq);
-        Ok(RingReader { records, skipped })
+        Ok(RingReader { records, skipped: scan.skipped })
     }
 
     pub fn records(&self) -> Vec<Record> {
@@ -178,33 +188,70 @@ impl RingReader {
     }
 }
 
-/// Validates the header and scans the data area. Returns capacity, valid frames as
-/// (offset, frame length, record), and the count of corrupt frames.
-type Frame = (usize, usize, Record);
+const MAX_FRAME: usize = FRAME_OVERHEAD + MAX_PAYLOAD;
+/// Bytes read per step of a scan; peak scan memory is this plus one maximum-size frame.
+const SCAN_CHUNK: usize = 1024 * 1024;
 
-fn parse(bytes: &[u8]) -> Result<(u64, Vec<Frame>, usize), RingError> {
-    if bytes.len() < HEADER_LEN as usize
-        || &bytes[0..8] != FILE_MAGIC
-        || u32::from_le_bytes(bytes[8..12].try_into().unwrap()) != SCHEMA_VERSION
+struct Scan {
+    capacity: u64,
+    skipped: usize,
+    /// Size of the scan buffer, which is fixed for the whole scan.
+    #[cfg(test)]
+    buf_len: usize,
+}
+
+/// Validates the header, then streams the data area in `chunk`-sized reads, calling `on_frame`
+/// with (data offset, frame length, record) for each valid frame.
+fn scan(
+    mut file: impl Read,
+    chunk: usize,
+    mut on_frame: impl FnMut(u64, u64, Record),
+) -> Result<Scan, RingError> {
+    let mut header = [0u8; HEADER_LEN as usize];
+    match file.read_exact(&mut header) {
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Err(RingError::BadHeader),
+        r => r?,
+    }
+    if &header[0..8] != FILE_MAGIC
+        || u32::from_le_bytes(header[8..12].try_into().unwrap()) != SCHEMA_VERSION
     {
         return Err(RingError::BadHeader);
     }
-    let capacity = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-    let end = (HEADER_LEN as usize).saturating_add(capacity as usize).min(bytes.len());
-    let data = &bytes[HEADER_LEN as usize..end];
+    let capacity = u64::from_le_bytes(header[16..24].try_into().unwrap());
 
-    let mut frames = Vec::new();
+    let mut data = file.take(capacity);
+    let mut buf = vec![0u8; chunk + MAX_FRAME];
+    let (mut len, mut off, mut base) = (0usize, 0usize, 0u64);
+    let mut eof = false;
     let mut skipped = 0;
-    let mut off = 0;
-    while off + 4 <= data.len() {
-        if data[off..off + 4] != FRAME_MAGIC {
+    loop {
+        // Keep a full maximum-size frame in view unless the data area is exhausted.
+        if !eof && len - off < MAX_FRAME {
+            buf.copy_within(off..len, 0);
+            len -= off;
+            base += off as u64;
+            off = 0;
+            while len < buf.len() {
+                let n = data.read(&mut buf[len..])?;
+                if n == 0 {
+                    eof = true;
+                    break;
+                }
+                len += n;
+            }
+            continue;
+        }
+        if off + 4 > len {
+            break;
+        }
+        if buf[off..off + 4] != FRAME_MAGIC {
             off += 1;
             continue;
         }
-        match decode_frame(&data[off..]) {
-            Some((len, rec)) => {
-                frames.push((off, len, rec));
-                off += len;
+        match decode_frame(&buf[off..len]) {
+            Some((frame_len, rec)) => {
+                on_frame(base + off as u64, frame_len as u64, rec);
+                off += frame_len;
             }
             None => {
                 skipped += 1;
@@ -212,7 +259,12 @@ fn parse(bytes: &[u8]) -> Result<(u64, Vec<Frame>, usize), RingError> {
             }
         }
     }
-    Ok((capacity, frames, skipped))
+    Ok(Scan {
+        capacity,
+        skipped,
+        #[cfg(test)]
+        buf_len: buf.len(),
+    })
 }
 
 fn decode_frame(buf: &[u8]) -> Option<(usize, Record)> {
@@ -238,4 +290,36 @@ fn decode_frame(buf: &[u8]) -> Option<(usize, Record)> {
         payload: buf[FRAME_HEAD_LEN..crc_at].to_vec(),
     };
     Some((crc_at + 4, rec))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_does_not_read_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ring.bin");
+        let capacity = 4 * 1024 * 1024;
+        let mut ring = Ring::create(&path, capacity).unwrap();
+        // Frames of varying size so many of them straddle the tiny chunk boundaries.
+        for i in 1..=400u64 {
+            let payload = vec![b'a' + (i % 26) as u8; 1 + (i as usize * 37) % 3000];
+            ring.append(RecordKind::Sample, BootId([1; 16]), 0, i, &payload).unwrap();
+        }
+        drop(ring);
+
+        let chunk = 4096;
+        let mut seen = Vec::new();
+        let scan = scan(File::open(&path).unwrap(), chunk, |_, _, r| seen.push(r.seq)).unwrap();
+        assert_eq!(seen, (1..=400).collect::<Vec<_>>());
+        assert_eq!(scan.skipped, 0);
+        // The buffer is fixed at chunk + one maximum frame, far below the file size.
+        assert_eq!(scan.buf_len, chunk + MAX_FRAME);
+        assert!((scan.buf_len as u64) * 32 < HEADER_LEN + capacity);
+
+        let reader = RingReader::open_chunked(&path, chunk).unwrap();
+        assert_eq!(reader.records().len(), 400);
+        assert_eq!(Ring::open(&path).unwrap().next_seq, 401);
+    }
 }
