@@ -43,7 +43,8 @@ pub fn resolve_volume_path(volume_guid: &str) -> Option<PathBuf> {
         if unsafe { GetLastError() } != ERROR_MORE_DATA {
             return None;
         }
-        buf.resize(needed as usize, 0);
+        let len = (needed as usize).max(buf.len() * 2);
+        buf.resize(len, 0);
     }
     let first = until_nul(&buf);
     (!first.is_empty()).then(|| PathBuf::from(OsString::from_wide(first)))

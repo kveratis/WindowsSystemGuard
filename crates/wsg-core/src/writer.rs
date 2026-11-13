@@ -21,7 +21,9 @@ use std::time::Duration;
 pub use crate::stats::WriterStats;
 pub use crate::volume::{resolve_volume_path, volume_guid_for};
 
-/// Records not yet confirmed in the primary that are kept for replay.
+/// Records not yet confirmed in the primary that are kept for replay. After an outage longer than
+/// this, only the newest `MEMORY_CAP` records are replayed to the primary; older ones live only in
+/// the fallback, so readers must merge primary and fallback (deduplicating by boot and mono_ns).
 // shortcut: fixed cap (about an hour of 1 Hz samples), make it configurable if a caller needs more.
 const MEMORY_CAP: usize = 4096;
 
@@ -84,7 +86,8 @@ impl TieredWriter {
         deadline: Duration,
         queue_cap: usize,
     ) -> TieredWriter {
-        let (queue, rx) = mpsc::sync_channel(queue_cap);
+        // A zero-capacity sync_channel is a rendezvous and would drop nearly every record.
+        let (queue, rx) = mpsc::sync_channel(queue_cap.max(1));
         let shared = Arc::new(Shared::default());
         let dispatcher = Dispatcher {
             primary: Worker::spawn(primary),
@@ -93,6 +96,7 @@ impl TieredWriter {
             shared: shared.clone(),
             last_seq: 0,
             pending: VecDeque::new(),
+            unflushed: Vec::new(),
             primary_dirty: false,
             fallback_dirty: false,
         };
@@ -208,6 +212,8 @@ struct Dispatcher {
     last_seq: u64,
     /// In seq order. Non-empty means new records must not bypass it to the primary.
     pending: VecDeque<Pending>,
+    /// Acknowledged by the primary since its last successful flush, so not yet known durable.
+    unflushed: Vec<NewRecord>,
     primary_dirty: bool,
     fallback_dirty: bool,
 }
@@ -247,17 +253,30 @@ impl Dispatcher {
 
     /// Applies a completed primary operation.
     fn settle(&mut self, tag: Busy, r: io::Result<()>) {
-        if r.is_err() {
-            return;
-        }
-        match tag {
-            Busy::Append(seq) => {
+        match (tag, r) {
+            (Busy::Append(seq), Ok(())) => {
                 self.primary_dirty = true;
-                if self.pending.front().is_some_and(|p| p.seq == seq) {
-                    self.pending.pop_front();
+                // A replayed record already in the fallback needs no second copy there.
+                if let Some(p) = self.pending.pop_front_if(|p| p.seq == seq) {
+                    if !p.in_fallback {
+                        self.unflushed.push(p.rec);
+                    }
                 }
             }
-            Busy::Flush => self.primary_dirty = false,
+            (Busy::Append(_), Err(_)) => {}
+            (Busy::Flush, Ok(())) => {
+                self.primary_dirty = false;
+                self.unflushed.clear();
+            }
+            (Busy::Flush, Err(_)) => self.spill_unflushed(),
+        }
+    }
+
+    /// The primary may not have persisted its recent records, so copy them to the fallback.
+    /// They stay out of `pending`: the primary already has them and gets no duplicate.
+    fn spill_unflushed(&mut self) {
+        for rec in std::mem::take(&mut self.unflushed) {
+            self.fallback_append(&rec);
         }
     }
 
@@ -278,6 +297,21 @@ impl Dispatcher {
                 }
             }
         }
+        // Records that reached neither sink go to the fallback once it accepts writes again.
+        let mut all_saved = true;
+        for i in 0..self.pending.len() {
+            if !self.pending[i].in_fallback {
+                let rec = self.pending[i].rec.clone();
+                if !self.fallback_append(&rec) {
+                    all_saved = false;
+                    break;
+                }
+                self.pending[i].in_fallback = true;
+            }
+        }
+        if all_saved {
+            self.shared.memory_only.store(false, Ordering::Relaxed);
+        }
         self.publish();
     }
 
@@ -288,6 +322,7 @@ impl Dispatcher {
             match self.primary.run(Op::Append(rec.clone()), Busy::Append(seq), self.deadline) {
                 Some(Ok(())) => {
                     self.primary_dirty = true;
+                    self.unflushed.push(rec);
                     self.shared.memory_only.store(false, Ordering::Relaxed);
                     self.publish();
                     return;
@@ -328,7 +363,10 @@ impl Dispatcher {
         if self.primary_dirty && self.primary.busy.is_none() {
             match self.primary.run(Op::Flush, Busy::Flush, self.deadline) {
                 Some(r) => self.settle(Busy::Flush, r),
-                None => self.stall(),
+                None => {
+                    self.stall();
+                    self.spill_unflushed();
+                }
             }
         }
         if self.fallback_dirty && self.fallback.busy.is_none() {

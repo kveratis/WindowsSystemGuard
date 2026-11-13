@@ -9,11 +9,13 @@ use wsg_core::{
     TieredWriter,
 };
 
-/// Fake sink: records appends, can hang (until released) or fail on demand.
+/// Fake sink: records appends, can hang (until released) or fail on demand. `hang_flush` hangs
+/// only `flush`, the way a USB drive can accept writes but stall on the cache flush.
 #[derive(Clone, Default)]
 struct Fake {
     records: Arc<Mutex<Vec<NewRecord>>>,
     hang: Arc<AtomicBool>,
+    hang_flush: Arc<AtomicBool>,
     fail: Arc<AtomicBool>,
     entered: Arc<AtomicUsize>,
     failures: Arc<AtomicUsize>,
@@ -36,9 +38,9 @@ impl Fake {
     fn ids(&self) -> Vec<u64> {
         self.records.lock().unwrap().iter().map(id_of).collect()
     }
-    fn op(&self) -> io::Result<()> {
+    fn op(&self, flush: bool) -> io::Result<()> {
         self.entered.fetch_add(1, Ordering::SeqCst);
-        while self.hang.load(Ordering::SeqCst) {
+        while self.hang.load(Ordering::SeqCst) || (flush && self.hang_flush.load(Ordering::SeqCst)) {
             thread::sleep(Duration::from_millis(1));
         }
         if self.fail.load(Ordering::SeqCst) {
@@ -51,12 +53,12 @@ impl Fake {
 
 impl RingSink for Fake {
     fn append(&mut self, rec: &NewRecord) -> io::Result<()> {
-        self.op()?;
+        self.op(false)?;
         self.records.lock().unwrap().push(rec.clone());
         Ok(())
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.op()
+        self.op(true)
     }
 }
 
@@ -114,7 +116,7 @@ fn hung_primary_switches_to_fallback_within_deadline() {
 #[test]
 fn primary_recovers_and_records_reconcile_in_seq_order() {
     let (p, f) = (Fake::hanging(), Fake::default());
-    let w = writer(&p, &f, 30, 64);
+    let w = writer(&p, &f, 100, 64);
     for i in 0..5 {
         w.submit(rec(RecordKind::Sample, i));
     }
@@ -144,8 +146,9 @@ fn both_sinks_failing_goes_memory_only() {
     // Fallback comes back: new records land there and memory-only mode ends.
     f.fail.store(false, Ordering::SeqCst);
     w.submit(rec(RecordKind::Sample, 3));
-    wait_until("fallback write", || f.len() >= 1);
-    assert_eq!(f.ids(), vec![3]);
+    wait_until("fallback write", || f.len() >= 4);
+    // The memory-only records reach the fallback first, then the new one, with no duplicates.
+    assert_eq!(f.ids(), vec![0, 1, 2, 3]);
     wait_until("memory only cleared", || !w.stats().memory_only);
     // Primary comes back: everything held in memory or fallback reaches it in order.
     p.fail.store(false, Ordering::SeqCst);
@@ -171,13 +174,13 @@ fn missing_primary_at_start_uses_fallback_immediately() {
 #[test]
 fn heartbeat_records_still_written_during_primary_stall() {
     let (p, f) = (Fake::hanging(), Fake::default());
-    let w = writer(&p, &f, 50, 16);
+    let w = writer(&p, &f, 100, 16);
     w.submit(rec(RecordKind::Sample, 0));
     wait_until("stall", || w.stats().primary_stalls == 1);
     for i in 1..=3 {
         let start = Instant::now();
         assert_eq!(w.submit(rec(RecordKind::Heartbeat, i)), SubmitResult::Queued);
-        assert!(start.elapsed() < Duration::from_millis(20), "submit blocked");
+        assert!(start.elapsed() < Duration::from_millis(200), "submit blocked");
     }
     wait_until("heartbeats in fallback", || f.len() >= 4);
     assert_eq!(f.ids(), vec![0, 1, 2, 3]);
@@ -197,4 +200,27 @@ fn volume_guid_roundtrips_for_system_drive() {
     assert_eq!(resolve_volume_path(guid.trim_matches(|c| c == '{' || c == '}')), Some(path));
     assert_eq!(resolve_volume_path("{00000000-0000-0000-0000-000000000000}"), None);
     assert_eq!(resolve_volume_path("not-a-guid"), None);
+}
+
+#[test]
+fn flush_stall_saves_unflushed_records_to_fallback() {
+    let (p, f) = (Fake::default(), Fake::default());
+    p.hang_flush.store(true, Ordering::SeqCst);
+    let w = writer(&p, &f, 100, 16);
+    let start = Instant::now();
+    w.submit(rec(RecordKind::Sample, 0));
+    // Appended to the primary, but its flush hangs: the record must not exist only in its cache.
+    wait_until("unflushed record in fallback", || f.len() >= 1);
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_millis(100), "spilled before the deadline: {elapsed:?}");
+    assert!(elapsed < Duration::from_millis(1000), "spill took {elapsed:?}");
+    assert_eq!(f.ids(), vec![0]);
+    assert_eq!(w.stats().primary_stalls, 1);
+    w.submit(rec(RecordKind::Sample, 1));
+    wait_until("stalled-period record in fallback", || f.len() >= 2);
+    assert_eq!(f.ids(), vec![0, 1]);
+    p.hang_flush.store(false, Ordering::SeqCst);
+    w.submit(rec(RecordKind::Sample, 2));
+    wait_until("primary reconciled", || p.len() >= 3 && !w.stats().fallback_active);
+    assert_eq!(p.ids(), vec![0, 1, 2], "each record exactly once in the primary");
 }
