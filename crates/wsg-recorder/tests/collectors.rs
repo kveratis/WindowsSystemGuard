@@ -83,3 +83,48 @@ fn wsl_collector_reports_bool_or_unavailable() {
         _ => panic!("unexpected outcome"),
     }
 }
+
+mod assemble_populated {
+    use super::*;
+    use wsg_core::sample::{CpuStats, DiskStats, MemStats};
+
+    fn cpu(x: f32) -> SampleFragment {
+        SampleFragment::Cpu(Reading::Value {
+            v: CpuStats { total_pct: x, dpc_pct: 0.0, interrupt_pct: 0.0 },
+            age_ms: 0,
+        })
+    }
+
+    #[test]
+    fn populated_fragments_land_in_their_fields() {
+        let d = DiskStats { disk_id: "0".into(), queue_len: 1.0, read_latency_ms: 1.0, write_latency_ms: 1.0, bytes_per_sec: 1 };
+        let m = MemStats { commit_bytes: 1, available_bytes: 2, nonpaged_pool_bytes: 3, paged_pool_bytes: 4 };
+        let s = assemble(
+            vec![
+                cpu(5.0),
+                SampleFragment::Mem(Reading::Value { v: m, age_ms: 0 }),
+                SampleFragment::Disks(vec![d]),
+                SampleFragment::Wsl(Reading::Value { v: true, age_ms: 0 }),
+            ],
+            10,
+        );
+        assert!(matches!(s.cpu, Reading::Value { ref v, .. } if v.total_pct == 5.0));
+        assert!(matches!(s.mem, Reading::Value { ref v, .. } if v.available_bytes == 2));
+        assert_eq!(s.disks.len(), 1);
+        assert!(matches!(s.wsl_vm_running, Reading::Value { v: true, .. }));
+    }
+
+    #[test]
+    fn duplicate_fragments_last_wins() {
+        let s = assemble(vec![cpu(1.0), cpu(2.0)], 10);
+        assert!(matches!(s.cpu, Reading::Value { ref v, .. } if v.total_pct == 2.0));
+    }
+
+    #[test]
+    fn nested_multi_and_heartbeat_inside_multi() {
+        let inner = SampleFragment::Multi(vec![cpu(7.0), SampleFragment::Heartbeat { counter: 1, mono_ns: 1 }]);
+        let s = assemble(vec![SampleFragment::Multi(vec![inner])], 10);
+        assert!(matches!(s.cpu, Reading::Value { ref v, .. } if v.total_pct == 7.0));
+        assert!(matches!(s.mem, Reading::Unavailable { .. }));
+    }
+}

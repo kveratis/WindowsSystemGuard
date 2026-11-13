@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+use windows_sys::Win32::System::Threading::ALL_PROCESSOR_GROUPS;
 use windows_sys::Win32::System::Threading::*;
 use wsg_core::sample::ProcStat;
 
@@ -28,12 +28,11 @@ fn ft(f: FILETIME) -> u64 {
 
 impl ProcessCollector {
     pub fn new(top_n: usize) -> Self {
-        // SAFETY: SYSTEM_INFO is plain data; GetSystemInfo fills it.
-        let mut si: SYSTEM_INFO = unsafe { std::mem::zeroed() };
-        unsafe { GetSystemInfo(&mut si) };
+        // SAFETY: no pointers; counts logical processors across all groups.
+        let ncpu = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
         let mut c = ProcessCollector {
             top_n,
-            ncpu: si.dwNumberOfProcessors.max(1) as f64,
+            ncpu: ncpu.max(1) as f64,
             prev: HashMap::new(),
             prev_at: None,
             enum_ms: 0,

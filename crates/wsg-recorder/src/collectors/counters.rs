@@ -32,14 +32,20 @@ fn scalar(h: Option<PDH_HCOUNTER>) -> Option<f64> {
     (rc == 0 && v.CStatus == 0).then_some(unsafe { v.Anonymous.doubleValue })
 }
 
-/// (instance name, value) pairs for a wildcard counter, `_Total` excluded.
-fn array(h: Option<PDH_HCOUNTER>) -> Vec<(String, f64)> {
-    let Some(h) = h else { return vec![] };
+/// (instance name, value) pairs for a wildcard counter, `_Total` excluded. `None` (with a note in
+/// `errors`) if the counter was never added or the read failed; items with a bad status are
+/// dropped and noted, so the instance is simply absent for this counter.
+fn array(h: Option<PDH_HCOUNTER>, what: &str, errors: &mut Vec<String>) -> Option<Pairs> {
+    let Some(h) = h else {
+        errors.push(format!("{what}: counter not available"));
+        return None;
+    };
     let (mut size, mut n) = (0u32, 0u32);
     // SAFETY: size query with a null buffer, per PDH contract (returns PDH_MORE_DATA).
     unsafe { PdhGetFormattedCounterArrayW(h, PDH_FMT_DOUBLE, &mut size, &mut n, std::ptr::null_mut()) };
     if size == 0 {
-        return vec![];
+        errors.push(format!("{what}: size query failed"));
+        return None;
     }
     // u64 backing keeps the buffer 8-byte aligned for PDH_FMT_COUNTERVALUE_ITEM_W.
     let mut buf = vec![0u64; (size as usize).div_ceil(8)];
@@ -47,26 +53,69 @@ fn array(h: Option<PDH_HCOUNTER>) -> Vec<(String, f64)> {
     // SAFETY: buf is at least `size` bytes; PDH fills n items whose name pointers point into buf.
     let rc = unsafe { PdhGetFormattedCounterArrayW(h, PDH_FMT_DOUBLE, &mut size, &mut n, p) };
     if rc != 0 {
-        return vec![];
+        errors.push(format!("{what}: PDH 0x{rc:08x}"));
+        return None;
     }
-    (0..n as usize)
-        .filter_map(|i| {
-            // SAFETY: i < n items initialised by PDH above.
-            let it = unsafe { &*p.add(i) };
-            if it.FmtValue.CStatus != 0 {
-                return None;
-            }
-            let mut len = 0;
-            // SAFETY: szName is a NUL-terminated wide string inside buf.
-            while unsafe { *it.szName.add(len) } != 0 {
-                len += 1;
-            }
-            let name = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(it.szName, len) });
-            // SAFETY: PDH_FMT_DOUBLE requested.
-            let v = unsafe { it.FmtValue.Anonymous.doubleValue };
-            (name != "_Total").then_some((name, v))
-        })
-        .collect()
+    let mut out = vec![];
+    for i in 0..n as usize {
+        // SAFETY: i < n items initialised by PDH above.
+        let it = unsafe { &*p.add(i) };
+        let mut len = 0;
+        // SAFETY: szName is a NUL-terminated wide string inside buf.
+        while unsafe { *it.szName.add(len) } != 0 {
+            len += 1;
+        }
+        let name = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(it.szName, len) });
+        if name == "_Total" {
+            continue;
+        }
+        if it.FmtValue.CStatus != 0 {
+            errors.push(format!("{what}: instance '{name}' bad status 0x{:08x}", it.FmtValue.CStatus));
+            continue;
+        }
+        // SAFETY: PDH_FMT_DOUBLE requested.
+        out.push((name, unsafe { it.FmtValue.Anonymous.doubleValue }));
+    }
+    Some(out)
+}
+
+type Pairs = Vec<(String, f64)>;
+
+/// A disk is emitted only when all four values exist for its instance; otherwise it is skipped
+/// and noted. Never zero-fills.
+pub(crate) fn build_disks(
+    queue: &[(String, f64)],
+    rlat: &[(String, f64)],
+    wlat: &[(String, f64)],
+    bps: &[(String, f64)],
+    errors: &mut Vec<String>,
+) -> Vec<DiskStats> {
+    let get = |v: &[(String, f64)], id: &str| v.iter().find(|(n, _)| n == id).map(|x| x.1);
+    let mut out = vec![];
+    for (id, q) in queue {
+        match (get(rlat, id), get(wlat, id), get(bps, id)) {
+            (Some(r), Some(w), Some(b)) => out.push(DiskStats {
+                disk_id: id.clone(),
+                queue_len: *q as f32,
+                read_latency_ms: (r * 1000.0) as f32,
+                write_latency_ms: (w * 1000.0) as f32,
+                bytes_per_sec: b as u64,
+            }),
+            _ => errors.push(format!("disk '{id}': missing counter value, skipped")),
+        }
+    }
+    out
+}
+
+/// `None` (fragment omitted) when any of the four counters failed as a whole.
+pub(crate) fn disk_part(
+    q: Option<Pairs>,
+    r: Option<Pairs>,
+    w: Option<Pairs>,
+    b: Option<Pairs>,
+    errors: &mut Vec<String>,
+) -> Option<Vec<DiskStats>> {
+    Some(build_disks(&q?, &r?, &w?, &b?, errors))
 }
 
 struct DiskC {
@@ -87,6 +136,7 @@ pub struct CounterCollector {
     paged: Option<PDH_HCOUNTER>,
     disk: DiskC,
     net: Option<PDH_HCOUNTER>,
+    errors: Vec<String>,
 }
 
 // SAFETY: PDH handles are plain integers and the collector is only used from one thread at a time.
@@ -116,6 +166,7 @@ impl CounterCollector {
                 bps: add(q, r"\PhysicalDisk(*)\Disk Bytes/sec"),
             },
             net: add(q, r"\Network Interface(*)\Bytes Total/sec"),
+            errors: vec![],
         };
         // SAFETY: q is a live query. Primes the rate counters.
         let rc = unsafe { PdhCollectQueryData(q) };
@@ -123,6 +174,13 @@ impl CounterCollector {
             return Err(CounterError::Pdh("PdhCollectQueryData", rc));
         }
         Ok(c)
+    }
+}
+
+impl CounterCollector {
+    /// Problems noted by the most recent `collect` (empty when everything read cleanly).
+    pub fn last_errors(&self) -> &[String] {
+        &self.errors
     }
 }
 
@@ -169,32 +227,63 @@ impl Collector for CounterCollector {
         if t.elapsed() > budget {
             return CollectOutcome::TimedOut;
         }
-        let find = |v: &[(String, f64)], id: &str| v.iter().find(|(n, _)| n == id).map_or(0.0, |x| x.1);
-        let (q, r, w, b) = (
-            array(self.disk.queue),
-            array(self.disk.rd),
-            array(self.disk.wr),
-            array(self.disk.bps),
+        let mut errors = vec![];
+        let disks = disk_part(
+            array(self.disk.queue, "disk queue", &mut errors),
+            array(self.disk.rd, "disk read latency", &mut errors),
+            array(self.disk.wr, "disk write latency", &mut errors),
+            array(self.disk.bps, "disk bytes/sec", &mut errors),
+            &mut errors,
         );
-        let disks = q
-            .iter()
-            .map(|(id, ql)| DiskStats {
-                disk_id: id.clone(),
-                queue_len: *ql as f32,
-                read_latency_ms: (find(&r, id) * 1000.0) as f32,
-                write_latency_ms: (find(&w, id) * 1000.0) as f32,
-                bytes_per_sec: find(&b, id) as u64,
-            })
-            .collect();
-        let net = array(self.net)
-            .into_iter()
-            .map(|(adapter, v)| NetStats { adapter, bytes_per_sec: v as u64 })
-            .collect();
-        CollectOutcome::Ok(SampleFragment::Multi(vec![
-            SampleFragment::Cpu(cpu),
-            SampleFragment::Mem(mem),
-            SampleFragment::Disks(disks),
-            SampleFragment::Net(net),
-        ]))
+        let net = array(self.net, "net bytes/sec", &mut errors).map(|v| {
+            v.into_iter()
+                .map(|(adapter, v)| NetStats { adapter, bytes_per_sec: v as u64 })
+                .collect()
+        });
+        if matches!(cpu, Reading::Unavailable { .. }) {
+            errors.push("cpu counters not ready".into());
+        }
+        if matches!(mem, Reading::Unavailable { .. }) {
+            errors.push("memory counters unavailable".into());
+        }
+        self.errors = errors;
+        // Parts that failed are omitted so `assemble` marks them missing.
+        let mut parts = vec![SampleFragment::Cpu(cpu), SampleFragment::Mem(mem)];
+        parts.extend(disks.map(SampleFragment::Disks));
+        parts.extend(net.map(SampleFragment::Net));
+        CollectOutcome::Ok(SampleFragment::Multi(parts))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(items: &[(&str, f64)]) -> Pairs {
+        items.iter().map(|(n, v)| (n.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn disk_without_all_four_counters_is_skipped_not_zero_filled() {
+        let mut errs = vec![];
+        let d = build_disks(
+            &p(&[("0 C:", 1.0), ("1 D:", 2.0)]),
+            &p(&[("0 C:", 0.002), ("1 D:", 0.003)]),
+            &p(&[("0 C:", 0.004)]), // D: write latency missing
+            &p(&[("0 C:", 100.0), ("1 D:", 200.0)]),
+            &mut errs,
+        );
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].disk_id, "0 C:");
+        assert_eq!(d[0].bytes_per_sec, 100);
+        assert!(errs.iter().any(|e| e.contains("1 D:")));
+    }
+
+    #[test]
+    fn counter_failure_is_reported_in_last_errors() {
+        let mut errs = vec![];
+        assert!(array(None, "disk queue", &mut errs).is_none());
+        assert!(errs[0].contains("disk queue"));
+        assert!(disk_part(None, Some(vec![]), Some(vec![]), Some(vec![]), &mut errs).is_none());
     }
 }

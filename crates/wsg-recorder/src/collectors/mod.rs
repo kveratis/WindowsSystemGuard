@@ -54,6 +54,7 @@ pub(crate) fn value<T>(v: T) -> Reading<T> {
     Reading::Value { v, age_ms: 0 }
 }
 
+/// Merges fragments into a `Sample`; if two fragments target the same field the last one wins.
 pub fn assemble(frags: Vec<SampleFragment>, cycle_ms: u32) -> Sample {
     fn missing<T>() -> Reading<T> {
         Reading::Unavailable { reason: "no collector result".into() }
