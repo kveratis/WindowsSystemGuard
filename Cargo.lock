@@ -377,6 +377,11 @@ version = "0.1.0"
 [[package]]
 name = "wsg-recorder"
 version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "windows-sys",
+ "wsg-core",
+]
 
 [[package]]
 name = "zmij"

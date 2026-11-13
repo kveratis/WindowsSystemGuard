@@ -3,3 +3,15 @@ name = "wsg-recorder"
 version = "0.1.0"
 edition = "2021"
 publish = false
+
+[dependencies]
+wsg-core = { path = "../wsg-core" }
+thiserror = "2.0.21"
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_System_Performance",
+  "Win32_System_Threading",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_SystemInformation",
+] }
