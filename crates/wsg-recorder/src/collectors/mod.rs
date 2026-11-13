@@ -1,15 +1,19 @@
 //! In-process collectors. Each produces one `SampleFragment` per call; `assemble` merges them.
 
 use std::time::{Duration, Instant};
-use wsg_core::sample::{CpuStats, DiskStats, MemStats, NetStats, ProcStat, Reading, Sample};
+use wsg_core::sample::{
+    CpuStats, DiskStats, GpuStats, MemStats, NetStats, ProcStat, Reading, Sample, SensorSet,
+};
 
 mod counters;
 mod heartbeat;
+mod helpers;
 mod processes;
 mod wsl;
 
 pub use counters::{CounterCollector, CounterError};
 pub use heartbeat::HeartbeatCollector;
+pub use helpers::{gpu_from_json, sensors_from_json, GpuCollector, SensorCollector};
 pub use processes::ProcessCollector;
 pub use wsl::WslCollector;
 
@@ -23,6 +27,8 @@ pub enum SampleFragment {
     NetUnavailable(String),
     Procs(Vec<ProcStat>),
     Wsl(Reading<bool>),
+    Gpu(Reading<GpuStats>),
+    Sensors(Reading<SensorSet>),
     /// Liveness proof; ignored by `assemble` (written as its own heartbeat record).
     Heartbeat { counter: u64, mono_ns: u64 },
     /// A collector that covers several `Sample` fields (e.g. PDH) returns its parts here.
@@ -83,6 +89,8 @@ pub fn assemble(frags: Vec<SampleFragment>, cycle_ms: u32) -> Sample {
             SampleFragment::NetUnavailable(reason) => s.net = Reading::Unavailable { reason },
             SampleFragment::Procs(v) => s.procs = v,
             SampleFragment::Wsl(r) => s.wsl_vm_running = r,
+            SampleFragment::Gpu(r) => s.gpu = r,
+            SampleFragment::Sensors(r) => s.sensors = r,
             SampleFragment::Heartbeat { .. } => {}
             SampleFragment::Multi(v) => v.into_iter().for_each(|f| apply(s, f)),
         }

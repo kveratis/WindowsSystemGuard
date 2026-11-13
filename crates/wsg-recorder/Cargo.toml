@@ -7,6 +7,9 @@ publish = false
 [dependencies]
 wsg-core = { path = "../wsg-core" }
 thiserror = "2.0.21"
+serde_json = "1.0.154"
+# Used only by the wsg-gpu-helper bin; the library never calls NVML.
+nvml-wrapper = "0.13.0"
 windows-sys = { version = "0.61.2", features = [
   "Win32_Foundation",
   "Win32_System_Performance",
