@@ -3,3 +3,10 @@ name = "wsg-core"
 version = "0.1.0"
 edition = "2021"
 publish = false
+
+[dependencies]
+crc32fast = "1.5.5"
+thiserror = "2.0.21"
+
+[dev-dependencies]
+tempfile = "3.27.0"
