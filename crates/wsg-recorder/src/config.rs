@@ -29,6 +29,8 @@ pub enum ConfigError {
     Acl(PathBuf, u32),
     #[error("invalid config: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error("interval_ms {0} is outside 250..=60000")]
+    Interval(u64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -36,7 +38,16 @@ pub enum ConfigError {
 pub struct Config {
     #[serde(default = "default_interval_ms")]
     pub interval_ms: u64,
+    /// Primary ring; defaults to `ring.bin` in the data directory.
+    #[serde(default)]
+    pub ring_path: Option<PathBuf>,
+    /// Fallback ring, which must be on a different volume from the primary.
+    #[serde(default)]
+    pub fallback_path: Option<PathBuf>,
 }
+
+/// Accepted sampling interval, in milliseconds.
+pub const INTERVAL_RANGE: std::ops::RangeInclusive<u64> = 250..=60_000;
 
 fn default_interval_ms() -> u64 {
     1000
@@ -44,7 +55,7 @@ fn default_interval_ms() -> u64 {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { interval_ms: default_interval_ms() }
+        Config { interval_ms: default_interval_ms(), ring_path: None, fallback_path: None }
     }
 }
 
@@ -60,10 +71,14 @@ pub fn default_path() -> PathBuf {
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
     check_acl(path)?;
     let text = std::fs::read_to_string(path).map_err(|e| ConfigError::Io(path.into(), e))?;
-    Ok(toml::from_str(&text)?)
+    let cfg: Config = toml::from_str(&text)?;
+    if !INTERVAL_RANGE.contains(&cfg.interval_ms) {
+        return Err(ConfigError::Interval(cfg.interval_ms));
+    }
+    Ok(cfg)
 }
 
-fn sid_string(sid: PSID) -> String {
+pub(crate) fn sid_string(sid: PSID) -> String {
     let mut p: *mut u16 = std::ptr::null_mut();
     // SAFETY: `sid` points into a live security descriptor; `p` is freed below.
     unsafe {

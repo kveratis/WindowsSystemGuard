@@ -62,6 +62,9 @@ impl Collector for GpuCollector {
     fn collect(&mut self, _budget: Duration) -> CollectOutcome {
         CollectOutcome::Ok(SampleFragment::Gpu(gpu_from_json(self.0.poll())))
     }
+    fn helper_stats(&self) -> Option<HelperStats> {
+        Some(self.0.stats())
+    }
 }
 
 pub struct SensorCollector(HelperSupervisor);
@@ -81,5 +84,8 @@ impl Collector for SensorCollector {
     }
     fn collect(&mut self, _budget: Duration) -> CollectOutcome {
         CollectOutcome::Ok(SampleFragment::Sensors(sensors_from_json(self.0.poll())))
+    }
+    fn helper_stats(&self) -> Option<HelperStats> {
+        Some(self.0.stats())
     }
 }

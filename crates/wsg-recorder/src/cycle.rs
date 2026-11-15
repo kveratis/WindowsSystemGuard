@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
+use wsg_core::stats::HelperStats;
 use wsg_core::{BootId, NewRecord, RecordKind, TieredWriter};
 
 use crate::collectors::{assemble_with_failures, CollectOutcome, Collector, SampleFragment};
@@ -29,8 +30,9 @@ impl Clock for SystemClock {
 pub struct Threaded {
     name: &'static str,
     req: Sender<Duration>,
-    res: Receiver<CollectOutcome>,
+    res: Receiver<(CollectOutcome, Option<HelperStats>)>,
     busy: bool,
+    stats: Option<HelperStats>,
 }
 
 impl Threaded {
@@ -40,12 +42,13 @@ impl Threaded {
         let (res_tx, res) = mpsc::channel();
         std::thread::spawn(move || {
             for budget in req_rx {
-                if res_tx.send(inner.collect(budget)).is_err() {
+                let out = inner.collect(budget);
+                if res_tx.send((out, inner.helper_stats())).is_err() {
                     break;
                 }
             }
         });
-        Threaded { name, req, res, busy: false }
+        Threaded { name, req, res, busy: false, stats: None }
     }
 }
 
@@ -61,12 +64,16 @@ impl Collector for Threaded {
                 return CollectOutcome::TimedOut;
             }
             self.busy = false;
+            // `try_recv` consumed the late pair; its outcome is stale but its stats are not.
         }
         if self.req.send(budget).is_err() {
             return CollectOutcome::Unavailable("collector thread exited".into());
         }
         match self.res.recv_timeout(budget) {
-            Ok(o) => o,
+            Ok((o, stats)) => {
+                self.stats = stats;
+                o
+            }
             Err(RecvTimeoutError::Timeout) => {
                 self.busy = true;
                 CollectOutcome::TimedOut
@@ -78,9 +85,18 @@ impl Collector for Threaded {
     fn is_threaded(&self) -> bool {
         true
     }
+
+    fn helper_stats(&self) -> Option<HelperStats> {
+        self.stats.clone()
+    }
 }
 
 static HEARTBEATS: AtomicU64 = AtomicU64::new(0);
+
+/// Cycles started by this process.
+pub fn cycles() -> u64 {
+    HEARTBEATS.load(Ordering::Relaxed)
+}
 
 fn record(kind: RecordKind, boot: BootId, clock: &dyn Clock, payload: Vec<u8>) -> NewRecord {
     NewRecord { kind, boot, utc_ns: clock.utc_ns(), mono_ns: clock.mono_ns(), payload }

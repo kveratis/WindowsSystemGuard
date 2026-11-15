@@ -48,6 +48,10 @@ pub trait Collector: Send {
     fn is_threaded(&self) -> bool {
         false
     }
+    /// Health of the isolated helper behind this collector, if it has one.
+    fn helper_stats(&self) -> Option<wsg_core::stats::HelperStats> {
+        None
+    }
 }
 
 /// Runs a collector and converts a result that arrived after `budget` into `TimedOut`.
