@@ -3,14 +3,23 @@
 //! of times, then abandoned.
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
+use std::os::windows::io::AsRawHandle;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use wsg_core::sample::Reading;
 pub use wsg_core::stats::HelperStats;
+use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
+
+/// A helper line longer than this is a protocol error.
+pub const MAX_LINE: usize = 1 << 20;
 
 #[derive(Debug, Clone)]
 pub struct HelperSpec {
@@ -29,6 +38,7 @@ struct Slot {
     child: Option<Child>,
     running_since: Option<Instant>,
     spawn_error: Option<String>,
+    job_error: Option<String>,
     cancelled: bool,
     latest: Option<(serde_json::Value, Instant)>,
 }
@@ -36,6 +46,7 @@ struct Slot {
 pub struct HelperSupervisor {
     spec: HelperSpec,
     slot: Arc<Mutex<Slot>>,
+    started_at: Instant,
     restart_times: VecDeque<Instant>,
     stats: HelperStats,
 }
@@ -45,6 +56,7 @@ impl HelperSupervisor {
         let mut s = HelperSupervisor {
             spec,
             slot: Arc::default(),
+            started_at: Instant::now(),
             restart_times: VecDeque::new(),
             stats: HelperStats::default(),
         };
@@ -54,6 +66,11 @@ impl HelperSupervisor {
 
     pub fn stats(&self) -> HelperStats {
         self.stats.clone()
+    }
+
+    /// Why the current child could not be put in the kill-on-close job, if it could not.
+    pub fn job_error(&self) -> Option<String> {
+        self.slot.lock().unwrap().job_error.clone()
     }
 
     /// Returns the helper's latest line and its age; never waits on the helper.
@@ -70,7 +87,7 @@ impl HelperSupervisor {
         // shortcut: a spawn still in progress is never a stall, because antivirus can hold
         // CreateProcess for tens of seconds; a CreateProcess that never returns only pins its thread.
         let Some(since) = slot.running_since else {
-            return unavailable("helper starting".into());
+            return unavailable(format!("helper starting for {} s", self.started_at.elapsed().as_secs()));
         };
         if !matches!(slot.child.as_mut().map(Child::try_wait), Some(Ok(None))) {
             drop(slot);
@@ -97,6 +114,7 @@ impl HelperSupervisor {
     /// Spawns the child and reads its stdout on one thread, so a slow spawn never blocks `poll`.
     fn start(&mut self) {
         self.slot = Arc::default();
+        self.started_at = Instant::now();
         let slot = self.slot.clone();
         let (exe, args) = (self.spec.exe.clone(), self.spec.args.clone());
         std::thread::spawn(move || {
@@ -118,6 +136,7 @@ impl HelperSupervisor {
                         return;
                     }
                     Ok(mut c) => {
+                        s.job_error = assign_to_job(&c).err();
                         let out = c.stdout.take();
                         s.child = Some(c);
                         s.running_since = Some(Instant::now());
@@ -125,10 +144,19 @@ impl HelperSupervisor {
                     }
                 }
             };
-            // Ends when the helper exits or is killed and the pipe closes.
-            for line in BufReader::new(out.expect("stdout is piped")).lines() {
-                let Ok(line) = line else { break };
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+            // Ends when the helper exits or is killed and the pipe closes, or on an overlong
+            // line: the helper then goes stale (or dies on the closed pipe) and is restarted.
+            let mut r = BufReader::new(out.expect("stdout is piped"));
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                match (&mut r).take(MAX_LINE as u64 + 1).read_until(b'\n', &mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) if line.len() > MAX_LINE => break,
+                    Ok(_) => {}
+                }
+                let parsed = std::str::from_utf8(&line).ok().and_then(|t| serde_json::from_str(t).ok());
+                if let Some(v) = parsed {
                     slot.lock().unwrap().latest = Some((v, Instant::now()));
                 }
             }
@@ -165,6 +193,35 @@ impl Drop for HelperSupervisor {
     fn drop(&mut self) {
         self.kill();
     }
+}
+
+/// Puts the child in a process-wide job that kills it when this process ends, even by crash.
+fn assign_to_job(c: &Child) -> Result<(), String> {
+    // Stored as usize because HANDLE is a raw pointer; the handle is never closed on purpose.
+    static JOB: OnceLock<Result<usize, String>> = OnceLock::new();
+    let job = JOB.get_or_init(|| unsafe {
+        let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if h.is_null() {
+            return Err(format!("CreateJobObjectW: {}", std::io::Error::last_os_error()));
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = SetInformationJobObject(
+            h,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const core::ffi::c_void,
+            std::mem::size_of_val(&info) as u32,
+        );
+        if ok == 0 {
+            return Err(format!("SetInformationJobObject: {}", std::io::Error::last_os_error()));
+        }
+        Ok(h as usize)
+    });
+    let job = *job.as_ref().map_err(Clone::clone)?;
+    if unsafe { AssignProcessToJobObject(job as HANDLE, c.as_raw_handle() as HANDLE) } == 0 {
+        return Err(format!("AssignProcessToJobObject: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 fn unavailable<T>(reason: String) -> Reading<T> {

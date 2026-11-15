@@ -2,20 +2,39 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use wsg_core::sample::SensorSet;
 
-/// GETs `/data.json` over HTTP/1.0 with 1 second connect, read and write timeouts.
+/// Largest `data.json` response accepted.
+pub const MAX_RESPONSE: u64 = 8 << 20;
+/// Whole-response deadline; the 1 s socket timeout only bounds each read.
+const RESPONSE_DEADLINE: Duration = Duration::from_secs(2);
+
+/// GETs `/data.json` over HTTP/1.0 with 1 second connect, read and write timeouts, at most
+/// `MAX_RESPONSE` bytes and about `RESPONSE_DEADLINE` (plus one read timeout) in total.
 pub fn fetch_data_json(addr: SocketAddr) -> Result<String, String> {
     let t = Duration::from_secs(1);
     let mut s = TcpStream::connect_timeout(&addr, t).map_err(|e| format!("connect {addr}: {e}"))?;
     s.set_read_timeout(Some(t)).and_then(|_| s.set_write_timeout(Some(t))).map_err(|e| e.to_string())?;
     s.write_all(format!("GET /data.json HTTP/1.0\r\nHost: {addr}\r\n\r\n").as_bytes())
         .map_err(|e| format!("send: {e}"))?;
-    let mut buf = Vec::new();
-    s.read_to_end(&mut buf).map_err(|e| format!("read: {e}"))?;
+    let started = Instant::now();
+    let (mut buf, mut chunk) = (Vec::new(), [0u8; 16 << 10]);
+    let mut body = (&s).take(MAX_RESPONSE + 1);
+    loop {
+        if started.elapsed() > RESPONSE_DEADLINE {
+            return Err(format!("response not complete within {} s", RESPONSE_DEADLINE.as_secs()));
+        }
+        match body.read(&mut chunk).map_err(|e| format!("read: {e}"))? {
+            0 => break,
+            n => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    if buf.len() as u64 > MAX_RESPONSE {
+        return Err(format!("response larger than {MAX_RESPONSE} bytes"));
+    }
     let text = String::from_utf8_lossy(&buf);
     let (head, body) = text.split_once("\r\n\r\n").ok_or("malformed HTTP response")?;
     let status = head.lines().next().unwrap_or("");
@@ -53,7 +72,7 @@ pub fn map_data_json(root: &Value) -> SensorSet {
                 }
                 max_cpu = Some(max_cpu.map_or(v, |m| m.max(v)));
             }
-            Some("clock") if is_cpu && text.contains("Core") => set.per_core_clock_mhz.push(v),
+            Some("clock") if is_cpu && text.contains("Core") && !text.contains("Effective") => set.per_core_clock_mhz.push(v),
             Some("voltage") => set.voltages.push((text.to_string(), v)),
             Some("fan") => set.fans_rpm.push((text.to_string(), v.round().max(0.0) as u32)),
             _ => {}
@@ -94,6 +113,7 @@ mod tests {
           {"id":3,"Text":"Clocks","Value":"","Children":[
             {"id":4,"Text":"Core #1","SensorId":"/amdcpu/0/clock/1","Value":"4200,5 MHz","Children":[]},
             {"id":5,"Text":"Core #2","SensorId":"/amdcpu/0/clock/2","Value":"3900 MHz","Children":[]},
+            {"id":16,"Text":"Core #1 (Effective)","SensorId":"/amdcpu/0/clock/11","Value":"800 MHz","Children":[]},
             {"id":6,"Text":"Bus Speed","SensorId":"/amdcpu/0/clock/0","Value":"100 MHz","Children":[]}]},
           {"id":7,"Text":"Temperatures","Value":"","Children":[
             {"id":8,"Text":"Core (CCD1)","SensorId":"/amdcpu/0/temperature/3","Value":"70,0 °C","Children":[]},
@@ -109,7 +129,7 @@ mod tests {
     fn map_data_json_uses_sensor_id_segments() {
         let s = map_data_json(&serde_json::from_str(FIXTURE).unwrap());
         assert_eq!(s.cpu_temp_c, Some(65.5), "Tctl/Tdie wins over the hotter core sensor and non-CPU temps");
-        assert_eq!(s.per_core_clock_mhz, vec![4200.5, 3900.0]);
+        assert_eq!(s.per_core_clock_mhz, vec![4200.5, 3900.0], "Bus Speed and Effective clocks excluded");
         assert_eq!(s.voltages, vec![("Core (SVI2 TFN)".to_string(), 1.23)]);
         assert_eq!(s.fans_rpm, vec![("Fan #1".to_string(), 1200)], "unparsable fan is skipped, not 0");
     }
@@ -119,5 +139,46 @@ mod tests {
         let fixture = FIXTURE.replace("Core (Tctl/Tdie)", "Core (CCD2)");
         assert_eq!(map_data_json(&serde_json::from_str(&fixture).unwrap()).cpu_temp_c, Some(70.0));
         assert_eq!(map_data_json(&serde_json::json!({"Children": []})).cpu_temp_c, None);
+    }
+
+    #[test]
+    fn sensor_line_round_trips_through_sensors_from_json() {
+        use wsg_core::sample::Reading;
+        let set = map_data_json(&serde_json::from_str(FIXTURE).unwrap());
+        let mut line = serde_json::to_value(&set).unwrap();
+        line["ok"] = serde_json::json!(true);
+        let r = crate::collectors::sensors_from_json(Reading::Value { v: line, age_ms: 3 });
+        assert_eq!(r, Reading::Value { v: set, age_ms: 3 });
+    }
+
+    /// Serves a 200 header, then `body` chunks every `pause` until the client goes away.
+    fn serve(chunk: &'static [u8], pause: Duration) -> SocketAddr {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let _ = c.write_all(b"HTTP/1.0 200 OK\r\n\r\n");
+            while c.write_all(chunk).is_ok() {
+                std::thread::sleep(pause);
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn endless_response_is_cut_at_the_size_cap() {
+        static CHUNK: [u8; 64 << 10] = [b'x'; 64 << 10];
+        let t = Instant::now();
+        let e = fetch_data_json(serve(&CHUNK, Duration::ZERO)).unwrap_err();
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert!(e.contains("larger than") || e.contains("not complete"), "{e}");
+    }
+
+    #[test]
+    fn dripping_response_hits_the_total_deadline() {
+        let t = Instant::now();
+        let e = fetch_data_json(serve(b"x", Duration::from_millis(100))).unwrap_err();
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert!(e.starts_with("response not complete"), "{e}");
     }
 }

@@ -154,3 +154,62 @@ fn gpu_unsupported_field_is_unavailable_not_zero() {
     }
 }
 
+
+#[test]
+fn helper_dies_when_recorder_is_killed() {
+    use std::io::BufRead;
+    use std::process::{Command, Stdio};
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+
+    // The parent plays the recorder: it supervises a hung helper and prints that helper's pid.
+    let mut parent = Command::new(env!("CARGO_BIN_EXE_wsg-fake-helper"))
+        .arg("supervise")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = parent.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::BufReader::new(out).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let pid: u32 = rx.recv_timeout(STARTUP).unwrap().trim().parse().unwrap();
+    let child = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    assert!(!child.is_null(), "hung helper {pid} should be running");
+
+    parent.kill().unwrap(); // TerminateProcess: no Drop runs in the parent
+    let _ = parent.wait();
+    let waited = unsafe { WaitForSingleObject(child, 5000) };
+    unsafe { CloseHandle(child) };
+    if waited != WAIT_OBJECT_0 {
+        // Do not leave the orphan behind when the assertion below fails.
+        let _ = Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).output();
+    }
+    assert_eq!(waited, WAIT_OBJECT_0, "helper {pid} outlived its killed supervisor");
+}
+
+#[test]
+fn overlong_line_is_protocol_error_and_helper_restarted() {
+    // The deadline outlasts the wait, so only the line cap (closing the pipe, which makes the
+    // flooding helper exit) can trigger the restart.
+    let mut s = HelperSupervisor::spawn(fake("flood", 50, 600_000, 5));
+    let t = Instant::now();
+    while s.stats().restarts == 0 && t.elapsed() < STARTUP {
+        assert!(!is_value(&s.poll()), "an overlong line must never become a value");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(s.stats().restarts >= 1, "{:?}", s.stats());
+}
+
+#[test]
+fn invalid_utf8_line_is_skipped() {
+    let mut s = HelperSupervisor::spawn(fake("badutf8", 50, 1000, 3));
+    let r = poll_until(&mut s, STARTUP, is_value);
+    match r {
+        Reading::Value { v, .. } => assert!(v["n"].is_number(), "{v}"),
+        other => panic!("reader should survive the bad line, got {other:?}"),
+    }
+    assert_eq!(s.stats().restarts, 0);
+}
