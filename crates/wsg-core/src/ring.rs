@@ -19,7 +19,8 @@ const HEADER_LEN: u64 = 24;
 const FRAME_MAGIC: [u8; 4] = *b"WSGF";
 const FRAME_HEAD_LEN: usize = 4 + 8 + 16 + 8 + 8 + 1 + 4;
 const FRAME_OVERHEAD: usize = FRAME_HEAD_LEN + 4;
-const MARKER_CLEAN: &[u8] = b"clean";
+/// Payload of the `Marker` record that ends a session cleanly.
+pub const MARKER_CLEAN: &[u8] = b"clean";
 
 /// Largest payload one record may carry.
 pub const MAX_PAYLOAD: usize = 64 * 1024;

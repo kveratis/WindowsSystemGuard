@@ -44,6 +44,10 @@ pub enum CollectOutcome {
 pub trait Collector: Send {
     fn name(&self) -> &'static str;
     fn collect(&mut self, budget: Duration) -> CollectOutcome;
+    /// True for collectors that already run on their own worker thread (see `cycle::Threaded`).
+    fn is_threaded(&self) -> bool {
+        false
+    }
 }
 
 /// Runs a collector and converts a result that arrived after `budget` into `TimedOut`.
@@ -65,18 +69,32 @@ pub(crate) fn value<T>(v: T) -> Reading<T> {
 
 /// Merges fragments into a `Sample`; if two fragments target the same field the last one wins.
 pub fn assemble(frags: Vec<SampleFragment>, cycle_ms: u32) -> Sample {
-    fn missing<T>() -> Reading<T> {
-        Reading::Unavailable { reason: "no collector result".into() }
+    assemble_with_failures(frags, cycle_ms, &[])
+}
+
+/// Like `assemble`, and every field no fragment filled says why: the failed collectors
+/// (`name: reason`) are appended to its reason, so a PDH error is told apart from a timeout.
+// shortcut: a collector's failure is not tied to the field it feeds, so each missing field
+// lists all failures of the cycle; tie them if one cycle often has several unrelated failures.
+pub fn assemble_with_failures(frags: Vec<SampleFragment>, cycle_ms: u32, failures: &[(&str, String)]) -> Sample {
+    let why = if failures.is_empty() {
+        "no collector result".to_string()
+    } else {
+        let list: Vec<String> = failures.iter().map(|(n, r)| format!("{n}: {r}")).collect();
+        format!("no collector result ({})", list.join("; "))
+    };
+    fn unavailable<T>(why: &str) -> Reading<T> {
+        Reading::Unavailable { reason: why.to_string() }
     }
     let mut s = Sample {
-        cpu: missing(),
-        mem: missing(),
-        disks: missing(),
-        net: missing(),
+        cpu: unavailable(&why),
+        mem: unavailable(&why),
+        disks: unavailable(&why),
+        net: unavailable(&why),
         procs: vec![],
-        gpu: missing(),
-        sensors: missing(),
-        wsl_vm_running: missing(),
+        gpu: unavailable(&why),
+        sensors: unavailable(&why),
+        wsl_vm_running: unavailable(&why),
         cycle_ms,
     };
     fn apply(s: &mut Sample, f: SampleFragment) {
