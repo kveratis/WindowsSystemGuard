@@ -4,7 +4,6 @@
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
-use std::os::windows::io::AsRawHandle;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -13,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wsg_core::sample::Reading;
 pub use wsg_core::stats::HelperStats;
 use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -118,6 +118,7 @@ impl HelperSupervisor {
         let slot = self.slot.clone();
         let (exe, args) = (self.spec.exe.clone(), self.spec.args.clone());
         std::thread::spawn(move || {
+            let job_error = join_job().err();
             let spawned = Command::new(exe)
                 .args(args)
                 .stdin(Stdio::null())
@@ -136,7 +137,7 @@ impl HelperSupervisor {
                         return;
                     }
                     Ok(mut c) => {
-                        s.job_error = assign_to_job(&c).err();
+                        s.job_error = job_error;
                         let out = c.stdout.take();
                         s.child = Some(c);
                         s.running_since = Some(Instant::now());
@@ -195,33 +196,35 @@ impl Drop for HelperSupervisor {
     }
 }
 
-/// Puts the child in a process-wide job that kills it when this process ends, even by crash.
-fn assign_to_job(c: &Child) -> Result<(), String> {
-    // Stored as usize because HANDLE is a raw pointer; the handle is never closed on purpose.
-    static JOB: OnceLock<Result<usize, String>> = OnceLock::new();
-    let job = JOB.get_or_init(|| unsafe {
-        let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-        if h.is_null() {
-            return Err(format!("CreateJobObjectW: {}", std::io::Error::last_os_error()));
-        }
-        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let ok = SetInformationJobObject(
-            h,
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as *const core::ffi::c_void,
-            std::mem::size_of_val(&info) as u32,
-        );
-        if ok == 0 {
-            return Err(format!("SetInformationJobObject: {}", std::io::Error::last_os_error()));
-        }
-        Ok(h as usize)
-    });
-    let job = *job.as_ref().map_err(Clone::clone)?;
-    if unsafe { AssignProcessToJobObject(job as HANDLE, c.as_raw_handle() as HANDLE) } == 0 {
-        return Err(format!("AssignProcessToJobObject: {}", std::io::Error::last_os_error()));
-    }
-    Ok(())
+/// Puts this process in a kill-on-close job, once. Children inherit the job when they are
+/// created, so a helper is never outside it, even if this process dies right after the spawn;
+/// when this process ends, however it ends, the job closes and kills every helper in it.
+fn join_job() -> Result<(), String> {
+    static JOINED: OnceLock<Result<(), String>> = OnceLock::new();
+    JOINED
+        .get_or_init(|| unsafe {
+            // The job handle is never closed on purpose: its closing is the kill signal.
+            let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if h.is_null() {
+                return Err(format!("CreateJobObjectW: {}", std::io::Error::last_os_error()));
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                h,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                std::mem::size_of_val(&info) as u32,
+            );
+            if ok == 0 {
+                return Err(format!("SetInformationJobObject: {}", std::io::Error::last_os_error()));
+            }
+            if AssignProcessToJobObject(h as HANDLE, GetCurrentProcess()) == 0 {
+                return Err(format!("AssignProcessToJobObject: {}", std::io::Error::last_os_error()));
+            }
+            Ok(())
+        })
+        .clone()
 }
 
 fn unavailable<T>(reason: String) -> Reading<T> {
@@ -230,4 +233,21 @@ fn unavailable<T>(reason: String) -> Reading<T> {
 
 fn utc_now_ns() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+
+    #[test]
+    fn child_is_born_inside_the_job() {
+        join_job().unwrap();
+        // A plain spawn, with no assignment step: membership comes from this process's job.
+        let mut c = Command::new("cmd").args(["/c", "ping -n 3 127.0.0.1 >nul"]).spawn().unwrap();
+        let mut inside = 0;
+        let ok = unsafe { IsProcessInJob(std::os::windows::io::AsRawHandle::as_raw_handle(&c) as HANDLE, std::ptr::null_mut(), &mut inside) };
+        let _ = c.kill();
+        assert!(ok != 0 && inside != 0, "child must be in a job without any post-spawn assignment");
+    }
 }

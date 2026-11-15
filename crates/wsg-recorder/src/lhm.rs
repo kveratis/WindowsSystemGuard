@@ -170,7 +170,7 @@ mod tests {
         static CHUNK: [u8; 64 << 10] = [b'x'; 64 << 10];
         let t = Instant::now();
         let e = fetch_data_json(serve(&CHUNK, Duration::ZERO)).unwrap_err();
-        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert!(t.elapsed() < Duration::from_secs(3), "took {:?}, error: {e}", t.elapsed());
         assert!(e.contains("larger than") || e.contains("not complete"), "{e}");
     }
 
@@ -178,7 +178,7 @@ mod tests {
     fn dripping_response_hits_the_total_deadline() {
         let t = Instant::now();
         let e = fetch_data_json(serve(b"x", Duration::from_millis(100))).unwrap_err();
-        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert!(t.elapsed() < Duration::from_secs(3), "took {:?}, error: {e}", t.elapsed());
         assert!(e.starts_with("response not complete"), "{e}");
     }
 }
