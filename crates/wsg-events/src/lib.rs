@@ -15,4 +15,4 @@ pub use reader::{
     DEFAULT_CHANNELS,
 };
 pub use score::{score, triage, History, IncidentWindow, Triaged};
-pub use xml::{parse_event_xml, EventRecord, XmlError};
+pub use xml::{format_system_time, parse_event_xml, EventRecord, XmlError};

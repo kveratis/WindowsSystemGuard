@@ -7,3 +7,4 @@ publish = false
 [dependencies]
 wsg-core = { path = "../wsg-core" }
 wsg-events = { path = "../wsg-events" }
+serde_json = "1.0.154"

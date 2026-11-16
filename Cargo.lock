@@ -589,6 +589,7 @@ dependencies = [
 name = "wsg-analysis"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "wsg-core",
  "wsg-events",
 ]

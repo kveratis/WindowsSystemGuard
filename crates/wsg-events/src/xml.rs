@@ -115,7 +115,7 @@ pub(crate) fn parse_system_time(s: &str) -> Option<i64> {
 }
 
 /// Nanoseconds since the Unix epoch to `2026-11-13T10:00:00.123Z`, rounded down to the millisecond.
-pub(crate) fn format_system_time(ns: i64) -> String {
+pub fn format_system_time(ns: i64) -> String {
     let ms_total = ns.div_euclid(1_000_000);
     let secs = ms_total.div_euclid(1000);
     let ms = ms_total.rem_euclid(1000);
