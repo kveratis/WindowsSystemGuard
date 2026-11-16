@@ -612,7 +612,10 @@ name = "wsg-events"
 version = "0.1.0"
 dependencies = [
  "roxmltree",
+ "serde",
+ "tempfile",
  "thiserror 2.0.21",
+ "toml",
  "windows-sys",
 ]
 
