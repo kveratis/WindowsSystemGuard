@@ -29,12 +29,13 @@ pub fn classify_gap(gap_start_utc_ns: i64, gap_end_utc_ns: i64, events: &[EventR
     }
 }
 
-/// Kernel-Power 42 (entering sleep), 506 and 507 (connected standby enter and exit), 105
-/// (power source change on resume) and Power-Troubleshooter 1 (woke from sleep).
+/// Kernel-Power 42 (entering sleep), 506 and 507 (connected standby enter and exit) and
+/// Power-Troubleshooter 1 (woke from sleep). Kernel-Power 105 is left out on purpose: it reports a
+/// power-source change, which also happens while the machine stays awake.
 fn is_sleep_event(e: &EventRecord) -> bool {
     matches!(
         (e.provider.as_str(), e.event_id),
-        ("Microsoft-Windows-Kernel-Power", 42 | 506 | 507 | 105) | ("Microsoft-Windows-Power-Troubleshooter", 1)
+        ("Microsoft-Windows-Kernel-Power", 42 | 506 | 507) | ("Microsoft-Windows-Power-Troubleshooter", 1)
     )
 }
 

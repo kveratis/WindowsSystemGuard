@@ -48,13 +48,18 @@ fn gap_spanning_sleep_events_is_sleep_not_freeze() {
         ev("Microsoft-Windows-Kernel-Power", 42, 101, &[]),
         ev("Microsoft-Windows-Kernel-Power", 506, 150, &[]),
         ev("Microsoft-Windows-Kernel-Power", 507, 399, &[]),
-        ev("Microsoft-Windows-Kernel-Power", 105, 399, &[]),
         ev("Microsoft-Windows-Power-Troubleshooter", 1, 401, &[]),
     ] {
         assert_eq!(classify_gap(100 * SEC, 400 * SEC, &[e.clone()]), GapKind::Sleep, "{} {}", e.provider, e.event_id);
     }
     let far = ev("Microsoft-Windows-Kernel-Power", 42, 5000, &[]);
     assert_eq!(classify_gap(100 * SEC, 400 * SEC, &[far]), GapKind::Freeze, "a sleep elsewhere does not explain this gap");
+}
+
+#[test]
+fn power_source_change_alone_is_not_sleep() {
+    let ac = ev("Microsoft-Windows-Kernel-Power", 105, 200, &[]);
+    assert_eq!(classify_gap(100 * SEC, 400 * SEC, &[ac]), GapKind::Freeze);
 }
 
 #[test]

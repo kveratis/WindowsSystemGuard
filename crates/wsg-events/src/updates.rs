@@ -49,9 +49,12 @@ pub fn update_event_from(e: &EventRecord) -> Option<UpdateEvent> {
             (UpdateKind::Failed { code: code.clone() }, get("updateTitle"), format!("error {code}"))
         }
         ("Microsoft-Windows-Kernel-PnP", 400) => {
-            let name = match get("DriverName") {
-                n if n.is_empty() => get("DeviceInstanceId"),
-                n => n,
+            // Keyed by driver and device, so one INF configured on ten devices is ten names, not
+            // one name installed ten times.
+            let name = match (get("DriverName"), get("DeviceInstanceId")) {
+                (d, dev) if d.is_empty() => dev,
+                (d, dev) if dev.is_empty() => d,
+                (d, dev) => format!("{d} [{dev}]"),
             };
             let detail = format!(
                 "device {} driver {} {} from {}",

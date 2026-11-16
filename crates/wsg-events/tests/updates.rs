@@ -94,8 +94,31 @@ fn pnp_driver_configuration_becomes_a_driver_install() {
     let mut e = wu(400, &[("DeviceInstanceId", r"ROOT\VMS_VSMP\0001"), ("DriverName", "wvms_mp_windows.inf"), ("DriverVersion", "10.0.26100.1"), ("DriverProvider", "Microsoft")]);
     e.provider = "Microsoft-Windows-Kernel-PnP".into();
     let u = update_event_from(&e).unwrap();
-    assert_eq!((u.kind, u.name.as_str()), (UpdateKind::DriverInstall, "wvms_mp_windows.inf"));
+    assert_eq!((u.kind, u.name.as_str()), (UpdateKind::DriverInstall, r"wvms_mp_windows.inf [ROOT\VMS_VSMP\0001]"));
     assert!(u.detail.contains("10.0.26100.1"));
+}
+
+#[test]
+fn one_inf_configured_on_many_devices_is_not_a_loop() {
+    let events: Vec<UpdateEvent> = (0..10)
+        .map(|i| {
+            let mut e = wu(400, &[("DeviceInstanceId", &format!(r"ROOT\DEV\{i:04}")), ("DriverName", "same.inf")]);
+            e.provider = "Microsoft-Windows-Kernel-PnP".into();
+            e.utc_ns = i * SEC;
+            update_event_from(&e).unwrap()
+        })
+        .collect();
+    assert!(detect_install_loops(&events, 3, Duration::from_secs(3600)).is_empty());
+    // The same device configured again and again still is.
+    let again: Vec<UpdateEvent> = (0..10)
+        .map(|i| {
+            let mut e = wu(400, &[("DeviceInstanceId", r"ROOT\DEV\0001"), ("DriverName", "same.inf")]);
+            e.provider = "Microsoft-Windows-Kernel-PnP".into();
+            e.utc_ns = i * SEC;
+            update_event_from(&e).unwrap()
+        })
+        .collect();
+    assert_eq!(detect_install_loops(&again, 3, Duration::from_secs(3600))[0].count, 10);
 }
 
 #[test]

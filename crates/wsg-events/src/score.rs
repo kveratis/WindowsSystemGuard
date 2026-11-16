@@ -42,9 +42,16 @@ pub fn score(g: &EventGroup, incident: Option<&IncidentWindow>, history: &Histor
     (level + frequency + novelty + proximity) as f32
 }
 
-/// Seconds between the group's nearest occurrence and the incident end.
+/// Seconds between the group's nearest occurrence and the incident end. The first and last
+/// occurrences count even when the capped timestamp list no longer holds them.
 fn distance_s(g: &EventGroup, w: &IncidentWindow) -> f64 {
-    let nearest = g.times_utc_ns.iter().copied().min_by_key(|t| t.abs_diff(w.end_utc_ns)).unwrap_or(g.last_utc_ns);
+    let nearest = g
+        .times_utc_ns
+        .iter()
+        .copied()
+        .chain([g.first_utc_ns, g.last_utc_ns])
+        .min_by_key(|t| t.abs_diff(w.end_utc_ns))
+        .unwrap_or(g.last_utc_ns);
     nearest.abs_diff(w.end_utc_ns) as f64 / 1e9
 }
 

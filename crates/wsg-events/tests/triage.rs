@@ -111,6 +111,19 @@ fn level_frequency_and_proximity_move_the_score_the_right_way() {
 }
 
 #[test]
+fn group_still_firing_at_incident_end_is_near_even_past_the_timestamp_cap() {
+    let w = IncidentWindow { start_utc_ns: 0, end_utc_ns: 100_000 * SEC };
+    let h = History::default();
+    // 2000 events: the first 1000 are far from the incident end, the last one is at it.
+    let mut evs: Vec<_> = (0..1999).map(|i| ev("P", 1, 2, i, &[])).collect();
+    evs.push(ev("P", 1, 2, 100_000, &[]));
+    let capped = group(&evs).remove(0);
+    assert_eq!(capped.times_utc_ns.len(), MAX_TIMES);
+    let old_only = group(&(0..2000).map(|i| ev("P", 1, 2, i, &[])).collect::<Vec<_>>()).remove(0);
+    assert!(score(&capped, Some(&w), &h) > score(&old_only, Some(&w), &h) + 1.0, "ongoing group ranks as near");
+}
+
+#[test]
 fn rules_roundtrip_through_file() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("noise.toml");
