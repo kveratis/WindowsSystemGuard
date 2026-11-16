@@ -110,12 +110,14 @@ fn run(data_dir: &Path, stop: Receiver<()>) -> Result<(), String> {
     let ring = cfg.ring_path.clone().unwrap_or_else(|| data_dir.join("ring.bin"));
     let fallback = cfg.fallback_path.clone().unwrap_or_else(|| data_dir.join("fallback.bin"));
     let boot = new_boot_id();
+    // The pipe is the single-instance lock: take it before anything archives or truncates a ring,
+    // so a second recorder is refused without touching the first one's files.
+    let status = Arc::new(Mutex::new(String::from("{}")));
+    let pipe = pipe::serve(pipe::PIPE_NAME, status.clone()).map_err(|e| format!("status pipe: {e}"))?;
     let session = Session::start(&ring, &fallback, &data_dir.join("archive"), boot).map_err(|e| e.to_string())?;
 
     let interval = Duration::from_millis(cfg.interval_ms);
     let mut collectors = build_collectors(interval);
-    let status = Arc::new(Mutex::new(String::from("{}")));
-    let pipe = pipe::serve(pipe::PIPE_NAME, status.clone()).map_err(|e| format!("status pipe: {e}"))?;
 
     let mut next = Instant::now();
     loop {

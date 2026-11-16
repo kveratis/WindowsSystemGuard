@@ -18,6 +18,19 @@ pub enum ServiceError {
     Archive(#[from] ArchiveError),
     #[error("preserving the previous fallback ring failed: {0}")]
     Preserve(#[from] io::Error),
+    #[error("ring and fallback are the same file: {0}")]
+    SamePath(String),
+}
+
+/// The path with symlinks, `..` and case resolved as far as the file system allows. A file that
+/// does not exist yet is resolved through its parent directory.
+fn identity(p: &Path) -> String {
+    let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    let resolved = abs.canonicalize().ok().or_else(|| {
+        let name = abs.file_name()?;
+        Some(abs.parent()?.canonicalize().ok()?.join(name))
+    });
+    resolved.unwrap_or(abs).to_string_lossy().to_lowercase()
 }
 
 /// A ring that could not be opened; every call fails, so the writer uses the other sink.
@@ -46,7 +59,12 @@ impl Session {
     /// `ring`. If archiving or preserving fails, nothing is truncated and the error is returned.
     /// A primary that cannot be created (drive absent) does not stop the session: records go to
     /// the fallback and `primary_error` says why.
+    // shortcut: only identical files are rejected; a fallback on the same volume as the primary
+    // is allowed (it protects less), enforce a different volume when the installer picks paths.
     pub fn start(ring: &Path, fallback: &Path, archive_dir: &Path, boot: BootId) -> Result<Session, ServiceError> {
+        if identity(ring) == identity(fallback) {
+            return Err(ServiceError::SamePath(ring.display().to_string()));
+        }
         if ring.exists() {
             archive_if_unclean(ring, archive_dir, boot, now_utc_ns())?;
         }

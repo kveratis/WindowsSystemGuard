@@ -190,3 +190,17 @@ fn collector_failure_reasons_reach_the_sample() {
     let wsg_core::Reading::Unavailable { reason } = s.cpu else { panic!("cpu should be unavailable") };
     assert!(reason.contains("failing: PDH 0x800007D1") && reason.contains("failing: timed out"), "{reason}");
 }
+
+#[test]
+fn same_ring_and_fallback_path_is_refused_without_touching_the_file() {
+    let d = tempfile::tempdir().unwrap();
+    let ring = d.path().join("ring.bin");
+    Ring::create(&ring, 1 << 20).unwrap();
+    let before = std::fs::read(&ring).unwrap();
+    let alias = d.path().join(".").join("RING.BIN");
+    for fb in [ring.clone(), alias] {
+        let r = Session::start(&ring, &fb, &d.path().join("archive"), new_boot_id());
+        assert!(matches!(r, Err(wsg_recorder::service::ServiceError::SamePath(_))), "{fb:?}");
+    }
+    assert_eq!(std::fs::read(&ring).unwrap(), before, "ring left untouched");
+}
