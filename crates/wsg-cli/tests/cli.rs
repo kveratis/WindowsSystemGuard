@@ -28,12 +28,18 @@ fn empty_sample() -> Sample {
 
 /// A ring for an unclean session: `n` seconds of heartbeats and samples, no clean marker.
 fn unclean_ring(path: &Path, boot: BootId, n: u64) {
+    unclean_ring_step(path, boot, n, 1);
+}
+
+/// Like `unclean_ring`, with the recorder sampling every `step_s` seconds.
+fn unclean_ring_step(path: &Path, boot: BootId, n: u64, step_s: u64) {
     let mut r = Ring::create(path, 1 << 20).unwrap();
-    let start = now_utc_ns() - n as i64 * 1_000_000_000;
+    let step = step_s as i64 * 1_000_000_000;
+    let start = now_utc_ns() - n as i64 * step;
     for t in 0..n {
-        let utc = start + t as i64 * 1_000_000_000;
-        r.append(RecordKind::Heartbeat, boot, utc, t * 1_000_000_000, &[]).unwrap();
-        r.append(RecordKind::Sample, boot, utc, t * 1_000_000_000, &empty_sample().encode()).unwrap();
+        let utc = start + t as i64 * step;
+        r.append(RecordKind::Heartbeat, boot, utc, t * step as u64, &[]).unwrap();
+        r.append(RecordKind::Sample, boot, utc, t * step as u64, &empty_sample().encode()).unwrap();
     }
     r.flush().unwrap();
 }
@@ -155,4 +161,27 @@ fn install_dry_run_prints_planned_actions() {
     let u = text(&wsg(d.path(), &["uninstall", "--dry-run"]));
     assert!(u.contains("sc.exe delete WindowsSystemGuard") && u.contains("schtasks.exe /Delete"), "{u}");
     assert_eq!(service_exists(), had, "a dry run must not change the machine");
+}
+
+#[test]
+fn slow_recorder_cadence_does_not_move_freeze_onset_to_the_first_heartbeat() {
+    let d = tempfile::tempdir().unwrap();
+    let (ring, archive) = (d.path().join("ring.bin"), d.path().join("archive"));
+    // 30 heartbeats five seconds apart: the 59th record is the last heartbeat.
+    unclean_ring_step(&ring, BootId([5; 16]), 30, 5);
+    archive_if_unclean(&ring, &archive, new_boot_id(), now_utc_ns()).unwrap().unwrap();
+    let o = wsg(d.path(), &["postmortem", "--no-events"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let t = text(&o);
+    let onset = t.lines().find(|l| l.contains("Freeze onset estimate")).unwrap_or_else(|| panic!("{t}"));
+    assert!(onset.contains("(record 59)"), "onset should be the last heartbeat: {onset}");
+}
+
+#[test]
+fn install_plan_quotes_the_service_executable_path() {
+    let d = tempfile::tempdir().unwrap();
+    let t = text(&wsg(d.path(), &["install", "--dry-run"]));
+    let create = t.lines().find(|l| l.contains("sc.exe create")).unwrap();
+    assert!(create.contains(r#"binPath= "\"C:\"#) || create.contains(r#"binPath= "\""#), "path stored with literal quotes: {create}");
+    assert!(create.contains(r#"wsg-recorder.exe\"""#), "closing quote after the executable: {create}");
 }

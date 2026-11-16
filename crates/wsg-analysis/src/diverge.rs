@@ -144,11 +144,14 @@ fn level_divergences(window: &[Stamped], baseline: &[Stamped], min_ratio: f64) -
             base.entry(m).or_default().push(v);
         }
     }
+    // A process absent from the baseline is a finding only if the baseline recorded processes at
+    // all; an empty baseline or one whose process list was unavailable shows nothing about it.
+    let baseline_has_procs = baseline.iter().any(|s| !s.sample.procs.is_empty());
     let mut out = Vec::new();
     for (metric, vals) in win {
         let med = match base.get_mut(&metric) {
             Some(b) => median(b),
-            None if metric.starts_with("proc ") => 0.0,
+            None if metric.starts_with("proc ") && baseline_has_procs => 0.0,
             None => continue,
         };
         let (dir, floor) = spec(&metric);
@@ -162,7 +165,9 @@ fn level_divergences(window: &[Stamped], baseline: &[Stamped], min_ratio: f64) -
     out
 }
 
-/// Growth across the window against growth across equally long stretches of the baseline.
+/// Growth across the window against growth across equally long stretches of the baseline. Only
+/// full-length stretches count: a shorter one would show less growth for the same rate. A baseline
+/// shorter than the window therefore yields no growth comparison.
 fn growth_divergences(window: &[Stamped], baseline: &[Stamped], min_ratio: f64) -> Vec<Divergence> {
     let span = window.len();
     if span < 2 {
@@ -179,7 +184,7 @@ fn growth_divergences(window: &[Stamped], baseline: &[Stamped], min_ratio: f64) 
         m
     };
     let mut base_growth: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
-    for chunk in baseline.chunks(span).filter(|c| c.len() == span || baseline.len() < span) {
+    for chunk in baseline.chunks(span).filter(|c| c.len() == span) {
         for (name, (first, _, last, _, _)) in growth_of(chunk) {
             base_growth.entry(name).or_default().push(last - first);
         }

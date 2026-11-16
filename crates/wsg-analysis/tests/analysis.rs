@@ -162,3 +162,30 @@ fn hardware_context_collects_on_this_machine() {
     assert!(!h.dimms.is_empty());
     assert!(h.dimms.iter().all(|d| d.capacity_bytes > 0));
 }
+
+#[test]
+fn empty_or_process_less_baseline_does_not_flag_every_process() {
+    use wsg_core::ProcStat;
+    let busy = |_| Sample {
+        procs: vec![ProcStat { pid: 1, name: "ordinary.exe".into(), cpu_pct: 20.0, working_set_bytes: 0, io_bytes_per_sec: 0, handles: 0 }],
+        ..empty()
+    };
+    let window = series(100, 5, busy);
+    assert!(diverged_metrics(&window, &[], 3.0).is_empty(), "no baseline at all");
+    let no_list = series(1, 30, |_| empty());
+    assert!(diverged_metrics(&window, &no_list, 3.0).is_empty(), "baseline never recorded processes");
+}
+
+#[test]
+fn baseline_shorter_than_the_window_gives_no_growth_comparison() {
+    let mem = |commit: u64| Sample {
+        mem: val(MemStats { commit_bytes: commit, available_bytes: 1 << 30, nonpaged_pool_bytes: 1 << 20, paged_pool_bytes: 1 << 20 }),
+        ..empty()
+    };
+    const GIB: u64 = 1 << 30;
+    // One minute of baseline growing at the same rate as a fifteen minute window: no divergence.
+    let rate = GIB / 100;
+    let baseline = series(1, 4, |i| mem(10 * GIB + i * rate));
+    let window = series(100, 15, |i| mem(10 * GIB + i * rate));
+    assert!(diverged_metrics(&window, &baseline, 3.0).is_empty());
+}

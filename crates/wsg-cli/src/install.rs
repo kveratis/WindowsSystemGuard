@@ -60,7 +60,7 @@ pub fn plan_install(p: &Paths) -> Vec<Step> {
     });
     steps.push(Step::Run {
         program: "sc.exe".into(),
-        args: ["create", SERVICE_NAME, "binPath=", &recorder.display().to_string(), "start=", "auto", "obj=", "LocalSystem", "DisplayName=", "Windows System Guard"]
+        args: ["create", SERVICE_NAME, "binPath=", &format!("\"{}\"", recorder.display()), "start=", "auto", "obj=", "LocalSystem", "DisplayName=", "Windows System Guard"]
             .iter()
             .map(|s| s.to_string())
             .collect(),

@@ -18,7 +18,22 @@ const LOOKBACK_NS: i64 = 15 * 60 * NS;
 /// How long after the last sample the restart reports are looked for.
 const AFTER_NS: i64 = 24 * 3600 * NS;
 const HISTORY_NS: i64 = 14 * 24 * 3600 * NS;
-const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const DEFAULT_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The recorder's cadence as it was recorded: the median gap between consecutive heartbeats of
+/// the newest boot. The configured interval is not stored in the ring, and assuming the default
+/// would make every gap of a slower cadence look like a stall.
+fn heartbeat_interval(records: &[wsg_core::Record]) -> std::time::Duration {
+    let Some(boot) = records.last().map(|r| r.boot) else { return DEFAULT_HEARTBEAT_INTERVAL };
+    let mut monos: Vec<u64> = records.iter().filter(|r| r.boot == boot && r.kind == RecordKind::Heartbeat).map(|r| r.mono_ns).collect();
+    monos.sort_unstable();
+    let mut gaps: Vec<u64> = monos.windows(2).map(|w| w[1] - w[0]).filter(|g| *g > 0).collect();
+    if gaps.is_empty() {
+        return DEFAULT_HEARTBEAT_INTERVAL;
+    }
+    gaps.sort_unstable();
+    std::time::Duration::from_nanos(gaps[gaps.len() / 2])
+}
 
 /// Renders the post-mortem for the archived ring in `archive_dir/<id>/`. With `live` false the
 /// event logs and hardware are not read, which is faster and is what the tests use.
@@ -32,7 +47,8 @@ pub fn analyze(archive_dir: &Path, id: &IncidentId, data_dir: &Path, live: bool)
         notes.push(format!("{} corrupt frame(s) in the archived ring were skipped", reader.skipped_corrupt()));
     }
 
-    let mut timeline = build_timeline(&records, &[], HEARTBEAT_INTERVAL);
+    let interval = heartbeat_interval(&records);
+    let mut timeline = build_timeline(&records, &[], interval);
     let last = timeline.last_sample_taken;
 
     // Samples of the newest boot: the last 15 minutes against everything earlier.
@@ -53,7 +69,7 @@ pub fn analyze(archive_dir: &Path, id: &IncidentId, data_dir: &Path, live: bool)
     if live {
         if let Some(last) = last {
             let events_after = collect_events(&["System"], last.utc_ns, last.utc_ns + AFTER_NS, 5);
-            timeline = build_timeline(&records, &events_after.0, HEARTBEAT_INTERVAL);
+            timeline = build_timeline(&records, &events_after.0, interval);
             notes.extend(events_after.1);
 
             let win = IncidentWindow { start_utc_ns: last.utc_ns - LOOKBACK_NS, end_utc_ns: last.utc_ns };
