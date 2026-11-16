@@ -5,6 +5,7 @@ pub mod group;
 pub mod noise;
 pub mod reader;
 pub mod score;
+pub mod updates;
 pub mod xml;
 
 pub use group::{group, group_key, EventGroup, GroupKey, MAX_TIMES, MAX_VARIANTS};
