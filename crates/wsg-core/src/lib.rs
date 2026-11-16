@@ -2,6 +2,7 @@
 
 pub mod archive;
 pub mod clock;
+pub mod merge;
 pub mod record;
 pub mod ring;
 pub mod sample;
@@ -10,6 +11,7 @@ pub mod volume;
 pub mod writer;
 
 pub use clock::{mono_ns, new_boot_id, now_utc_ns};
+pub use merge::{merge_records, merge_rings, merge_rings_with_notes};
 pub use record::{BootId, Record, RecordKind};
 pub use ring::{Ring, MARKER_CLEAN, RingError, RingReader, MAX_PAYLOAD};
 pub use stats::{HelperStats, WriterStats};
